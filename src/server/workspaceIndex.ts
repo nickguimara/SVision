@@ -6,6 +6,8 @@ import type { Node } from "web-tree-sitter";
 import { analyzeTree, classNamesIn } from "./analyzer.js";
 import { collectMacros, type MacroTable } from "./macros.js";
 import { Catalog } from "./catalog.js";
+import { IncludeResolver, type IncludeDirective } from "./includes.js";
+import { pathToUri, toPosix, uriToPath } from "./paths.js";
 import type { VerilogParser } from "./verilogParser.js";
 
 export interface IndexOptions {
@@ -17,6 +19,15 @@ export interface IndexOptions {
 
 /** How many undefined macro names are remembered before giving up on the list. */
 const MAX_REPORTED_MACROS = 200;
+
+/**
+ * How many passes of header reading one include chain may take.
+ *
+ * Headers include headers, so a pass that reads one leaves more to read. A real
+ * chain is a handful deep; the bound is what stops a pair of headers that
+ * include each other from looping.
+ */
+const MAX_INCLUDE_ROUNDS = 8;
 
 export const DEFAULT_INDEX_OPTIONS: IndexOptions = {
   // Must cover every extension the package declares as SystemVerilog or Verilog.
@@ -91,6 +102,11 @@ export class WorkspaceIndexer {
   /** Every macro defined in the workspace, so any file can expand any of them. */
   private readonly macroTable: MacroTable = new Map();
 
+  /** Headers an `include` named and the walk has not read yet. */
+  private readonly pendingIncludes = new Set<string>();
+  /** Files this indexer has actually parsed, so none is read twice. */
+  private readonly indexedPaths = new Set<string>();
+
   /**
    * Macro calls the workspace never defines, and where they were seen.
    *
@@ -111,6 +127,15 @@ export class WorkspaceIndexer {
     private readonly parser: VerilogParser,
     readonly catalog: Catalog,
     private readonly options: IndexOptions = DEFAULT_INDEX_OPTIONS,
+    /**
+     * Shared across indexer instances on purpose.
+     *
+     * The server builds a second indexer when settings arrive with the
+     * handshake, and a fresh resolver would start knowing nothing -- the
+     * includes resolved during startup would be forgotten, and the second pass
+     * would have to learn the same answers again.
+     */
+    readonly includes: IncludeResolver = new IncludeResolver(),
   ) {
     this.includeRes = options.include.map(globToRegExp);
     this.excludeRes = options.exclude.map(globToRegExp);
@@ -141,6 +166,8 @@ export class WorkspaceIndexer {
     let count = 0;
 
     for (const folder of folders) {
+      this.includes.noteRoot(folder);
+
       // Read every file, learn every class name and every macro, then parse.
       // Doing it the other way round makes the answer depend on directory
       // order, which is exactly the kind of bug that only shows up on someone
@@ -165,7 +192,98 @@ export class WorkspaceIndexer {
       }
     }
 
+    // Headers reached only through an `include` are part of the workspace, and
+    // whatever they declare is exactly what the files including them are
+    // missing. Reading them here is what closes that gap before the open
+    // documents are re-analysed.
+    count += await this.indexReachedIncludes();
+
     return count;
+  }
+
+  /**
+   * Reads the files an `include` named and the folder walk never visited.
+   *
+   * A header does not have to be under an indexed folder to be part of the
+   * design: a package sits wherever the project keeps its packages, and the
+   * include that names it is often the only thing that says where. Following it
+   * is the difference between `` cfg_pkg::WIDTH `` resolving and the file
+   * declaring an undeclared module, and nothing else in the index would find it.
+   *
+   * Only files reachable from a resolved include are read, so this cannot walk
+   * the filesystem -- the paths come from source, and every one of them is
+   * checked against the exclude patterns first.
+   */
+  async indexReachedIncludes(): Promise<number> {
+    let total = 0;
+
+    // Headers include headers, and the one that declares the type is often the
+    // furthest away -- so a pass that read a header leaves more to read. The
+    // rounds are bounded by the depth of any real chain, not by the file count.
+    for (let round = 0; round < MAX_INCLUDE_ROUNDS; round++) {
+      const wanted: string[] = [];
+      for (const file of this.pendingIncludes) {
+        if (this.indexedPaths.has(file)) continue;
+        wanted.push(file);
+      }
+      this.pendingIncludes.clear();
+      if (wanted.length === 0) break;
+
+      total += await this.readIncluded(wanted);
+    }
+
+    return total;
+  }
+
+  /**
+   * Reads and analyses a set of headers, learning from all of them first.
+   *
+   * The same two-pass order the folder walk uses: a macro defined in one header
+   * is used by another, and the answer must not depend on which was reached
+   * first.
+   */
+  private async readIncluded(absolutePaths: readonly string[]): Promise<number> {
+    const read: PendingFile[] = [];
+    for (const absolute of absolutePaths) {
+      const text = await this.read(absolute);
+      if (text !== undefined) read.push({ absolute, uri: pathToUri(absolute), text });
+    }
+
+    for (const file of read) {
+      this.includes.noteFile(file.absolute);
+      for (const name of classNamesIn(file.text)) this.classNames.add(name);
+      this.readMacros(file);
+    }
+
+    for (const file of read) {
+      this.parse(file);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    return read.length;
+  }
+
+  /**
+   * Resolves the includes of an open document and queues the files they name.
+   *
+   * The directives come from the document's own analysis, so this costs a map
+   * lookup per directive rather than another pass over the tree. With no
+   * workspace folder open the walk never sees a folder but the loose file's,
+   * and the package it pulls in is the one thing the author is looking at.
+   */
+  followIncludes(uri: string, directives: readonly IncludeDirective[]): void {
+    const absolute = uriToPath(uri);
+    if (!absolute) return;
+
+    for (const edge of this.includes.noteIncludes(absolute, directives)) {
+      if (!this.indexedPaths.has(edge.absolute)) this.pendingIncludes.add(edge.absolute);
+    }
+  }
+
+  /** Forgets a closed document's edges, so a stale header is not chased. */
+  forgetDocument(uri: string): void {
+    const absolute = uriToPath(uri);
+    if (absolute) this.includes.forget(absolute);
   }
 
   /**
@@ -225,6 +343,11 @@ export class WorkspaceIndexer {
       if (!this.includeRes.some((re) => re.test(relative))) continue;
       if (this.excludeRes.some((re) => re.test(relative))) continue;
 
+      // Noted before the file is read: a name in this folder is resolvable even
+      // if the file itself turns out to be unreadable, and the next document
+      // that includes something from here deserves the same search.
+      this.includes.noteFile(absolute);
+
       const text = await this.read(absolute);
       if (text !== undefined) into.push({ absolute, uri: pathToUri(absolute), text });
     }
@@ -255,8 +378,23 @@ export class WorkspaceIndexer {
       this.noteUndefinedMacros(tree, file);
 
       const analysis = analyzeTree(tree, file.text, this.classNames, undefined, this.macros);
-      this.catalog.replaceDocument(file.uri, analysis.scopes, analysis.accesses);
+
+      // What this file pulls in, read from the same traversal. The headers are
+      // queued whether or not the walk will reach them: one inside the folder
+      // being read is dropped again below, one outside it is read after.
+      this.includes.noteIncludes(file.absolute, analysis.includes);
+      for (const edge of this.includes.includesOf(file.absolute)) {
+        if (!this.indexedPaths.has(edge)) this.pendingIncludes.add(edge);
+      }
+
+      this.catalog.replaceDocument(
+        file.uri,
+        analysis.scopes,
+        analysis.accesses,
+        analysis.unitSymbols,
+      );
       this.indexed++;
+      this.indexedPaths.add(toPosix(file.absolute));
     } catch {
       // A malformed file must not abort the whole index.
     } finally {
@@ -318,28 +456,4 @@ function matchesGlobDir(re: RegExp, relativeDir: string): boolean {
   return re.test(trimmed) || re.test(`${trimmed}/`);
 }
 
-function toPosix(value: string): string {
-  return value.split(path.sep).join("/");
-}
-
-/**
- * Minimal `file://` URI encoder that handles Windows drive letters.
- *
- * The path segments are joined onto an empty scheme, and the leading slash is
- * taken from the path itself: prefixing `file://` onto an already-absolute path
- * yields `file:////...`, which is a different URI from `file:///...` and makes
- * every lookup by uri miss.
- */
-export function pathToUri(absolute: string): string {
-  const normalised = toPosix(absolute);
-  const encoded = normalised
-    .split("/")
-    .filter((segment) => segment.length > 0)
-    .map(encodeURIComponent)
-    .join("/");
-
-  const drive = /^([A-Za-z]):/.exec(encoded);
-  if (drive) return `file:///${encoded.replace(/^([A-Za-z]):/, "%241:")}`;
-
-  return `file:///${encoded}`;
-}
+export { pathToUri, toPosix } from "./paths.js";

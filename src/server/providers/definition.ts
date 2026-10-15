@@ -4,8 +4,9 @@ import type { Node } from "web-tree-sitter";
 import { resolveSymbol, type Analysis } from "../model.js";
 import { identifierAt } from "../locate.js";
 import { pathOf, resolvePath } from "../hierarchy.js";
-import { importedMember } from "../imports.js";
+import { importedMember, includedDeclaration } from "../imports.js";
 import type { Catalog } from "../catalog.js";
+import type { IncludeResolver } from "../includes.js";
 
 interface BindingContext {
   readonly kind: "port" | "parameter";
@@ -15,18 +16,21 @@ interface BindingContext {
 /**
  * Resolves the identifier under the cursor to its declaration.
  *
- * Handles three cases:
+ * Handles five cases:
  *  1. a reference to a symbol declared in the current file,
  *  2. a reference to a design unit (module / interface / package) anywhere in
  *     the workspace,
  *  3. a port or parameter name on an instantiation, which resolves against the
- *     instantiated unit's interface even across files.
+ *     instantiated unit's interface even across files,
+ *  4. a name a `` `include ``d header declares, which the file uses as its own,
+ *  5. a name an `import` makes usable unqualified.
  */
 export function provideDefinition(
   document: TextDocument,
   analysis: Analysis,
   catalog: Catalog,
   offset: number,
+  includes?: IncludeResolver,
 ): Location | Location[] | null {
   const node = identifierAt(analysis, offset);
   if (!node) return null;
@@ -75,6 +79,15 @@ export function provideDefinition(
   // and there is no path to walk -- the import is the only link.
   const imported = importedMember(analysis, catalog, offset, name);
   if (imported) return Location.create(imported.uri, imported.symbol.selectionRange);
+
+  // A name a header declares and this file pulls in with `` `include ``. It is
+  // declared in a file with no scope to declare it in, so without following the
+  // include there is nowhere left to look -- and a `typedef` in a shared header
+  // is the most ordinary thing in a project.
+  if (includes) {
+    const declared = includedDeclaration(document.uri, catalog, includes, name);
+    if (declared) return Location.create(declared.uri, declared.symbol.selectionRange);
+  }
 
   // A design unit referenced by name, possibly declared more than once.
   const locations = catalog.locations(name);

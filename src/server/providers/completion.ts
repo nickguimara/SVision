@@ -1,5 +1,6 @@
 import {
   CompletionItemKind,
+  InsertTextFormat,
   type CompletionItem,
   type CompletionList,
   type TextDocument,
@@ -9,11 +10,13 @@ import type { Node } from "web-tree-sitter";
 import type { Analysis, HdlScope, HdlSymbol } from "../model.js";
 import { scopeChain, visibleSymbols } from "../model.js";
 import { nodeAt } from "../locate.js";
-import { resolveNamedBlock } from "../hierarchy.js";
+import { interfaceOfType, resolveNamedBlock } from "../hierarchy.js";
 import type { Catalog } from "../catalog.js";
 import type { DocumentManager } from "../documentManager.js";
-import { importedMembers } from "../imports.js";
+import { importedMembers, includedDeclarations } from "../imports.js";
+import type { IncludeResolver } from "../includes.js";
 import { staticCompletionItems } from "../completionData.js";
+import { callableLabel, callAt, resolveCallable } from "../callables.js";
 import {
   CATEGORY_LABEL,
   describeSymbol,
@@ -65,8 +68,18 @@ export function provideCompletion(
   documents: DocumentManager,
   catalog: Catalog,
   settings: CompletionSettings,
+  includes?: IncludeResolver,
 ): CompletionList {
   const items: CompletionItem[] = [];
+  const call = callAt(context.document.getText(), context.offset);
+  if (call && /(?:\(|,)\s*\.\w*$/.test(context.document.getText().slice(0, context.offset))) {
+    const routine = resolveCallable(call.name, context.analysis, catalog, context.offset, context.document.uri, includes);
+    if (routine) return { isIncomplete: false, items: (routine.arguments ?? []).map((arg) => ({
+      label: arg.name, kind: CompletionItemKind.Property,
+      detail: `${arg.direction ?? "input"} ${arg.typeText}`,
+      insertText: `${arg.name}(\${1:${arg.name}})`, insertTextFormat: InsertTextFormat.Snippet,
+    })) };
+  }
   const connection = instantiationContext(context);
 
   if (connection) {
@@ -98,6 +111,21 @@ export function provideCompletion(
   // without this a perfectly good cross-file parameter is simply absent from
   // the list.
   const alreadyOffered = new Set(symbols.map((s) => s.name));
+
+  // Types a `` `include ``d header declares. They are written above the header's
+  // first module, so this file uses names it never declares -- and a completion
+  // list that omits them is why `hdr_` completes to nothing.
+  if (includes) {
+    for (const declared of includedDeclarations(context.document.uri, catalog, includes)) {
+      if (alreadyOffered.has(declared.symbol.name)) continue;
+      alreadyOffered.add(declared.symbol.name);
+
+      const item = symbolItem(declared.symbol, context, settings, "1");
+      item.detail = `${item.detail ?? ""} · ${declared.header}`.trim();
+      items.push(item);
+    }
+  }
+
   for (const imported of importedMembers(context.analysis, catalog, context.offset)) {
     if (alreadyOffered.has(imported.symbol.name)) continue;
     alreadyOffered.add(imported.symbol.name);
@@ -172,6 +200,7 @@ export function symbolItem(
 
   // Ports get a plain insert; nothing to expand.
   item.insertText = symbol.name;
+  applyCallable(item, symbol, context);
 
   // A parameter can be inserted as its resolved value with a "value:" commit.
   if (
@@ -297,7 +326,7 @@ function memberAccessContext(
   if (dotted) {
     const pkg = catalog.resolve(ownerName);
     if (!pkg) return undefined;
-    return { items: memberItems([...pkg.parameters, ...pkg.ports, ...pkg.symbols]) };
+    return { items: memberItems([...pkg.parameters, ...pkg.ports, ...pkg.symbols], context) };
   }
 
   const instance = context.analysis.scopes
@@ -311,7 +340,17 @@ function memberAccessContext(
     const members =
       entry.kind === "interface" ? [...entry.ports, ...entry.symbols] : entry.ports;
 
-    return { items: memberItems(members) };
+    return { items: memberItems(members, context) };
+  }
+
+  // `bus.data` where `bus` is a port of interface type (`bus_if.slave bus`).
+  // The port is a name bound to a scope that is not the one being written in, so
+  // it has to be followed through the interface it declares -- the same walk
+  // go-to-definition does.
+  const bound = visibleSymbols(context.analysis, context.offset).find((s) => s.name === ownerName);
+  const iface = bound ? interfaceOfType(bound.typeText, catalog) : undefined;
+  if (iface) {
+    return { items: memberItems([...iface.ports, ...iface.symbols], context) };
   }
 
   // `pkt.` where `pkt` is an object handle. A class offers its properties and
@@ -321,7 +360,7 @@ function memberAccessContext(
   );
   if (handle?.handleOf) {
     const members = catalog.classMembers(handle.handleOf);
-    if (members.length > 0) return { items: memberItems(members) };
+    if (members.length > 0) return { items: memberItems(members, context) };
   }
 
   // `main.` where `main` names a block: `begin : main ... end`. Its members are
@@ -329,7 +368,7 @@ function memberAccessContext(
   const block = namedBlockScope(context.analysis, context.offset, ownerName);
   if (block) {
     const members = [...block.parameters, ...block.ports, ...block.symbols];
-    if (members.length > 0) return { items: memberItems(members) };
+    if (members.length > 0) return { items: memberItems(members, context) };
   }
 
   return undefined;
@@ -346,7 +385,7 @@ function namedBlockScope(
 }
 
 /** Completion entries for one set of members, keeping each one's detail. */
-function memberItems(members: readonly HdlSymbol[]): CompletionItem[] {
+function memberItems(members: readonly HdlSymbol[], context: CompletionContext): CompletionItem[] {
   return members.map((symbol) => {
     const item: CompletionItem = {
       label: symbol.name,
@@ -354,8 +393,19 @@ function memberItems(members: readonly HdlSymbol[]): CompletionItem[] {
       detail: describeSymbol(symbol, { showWidth: true, showType: true }),
     };
     if (symbol.doc) item.documentation = symbol.doc;
+    applyCallable(item, symbol, context);
     return item;
   });
+}
+
+function applyCallable(item: CompletionItem, symbol: HdlSymbol, context: CompletionContext): void {
+  if (symbol.category !== "task" && symbol.category !== "function") return;
+  item.detail = callableLabel(symbol);
+  // Do not duplicate a call's parentheses when completing its name in place.
+  if (/^\w*\s*\(/.test(context.document.getText().slice(context.offset))) return;
+  item.insertTextFormat = InsertTextFormat.Snippet;
+  item.insertText = `${symbol.name}(${(symbol.arguments ?? []).map((a, i) => `\${${i + 1}:${a.name}}`).join(", ")})$0`;
+  item.command = { title: "Show arguments", command: "editor.action.triggerParameterHints" };
 }
 
 /** Bindings whose name and value can be completed from the interface. */

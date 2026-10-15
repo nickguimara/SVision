@@ -1,4 +1,5 @@
 import type { Range } from "vscode-languageserver-types";
+import type { IncludeDirective } from "./includes.js";
 
 /** Direction of a module/interface port. */
 export type PortDirection = "input" | "output" | "inout" | "ref" | "interface";
@@ -77,6 +78,8 @@ export interface HdlSymbol {
    * never mistaken for an object.
    */
   readonly handleOf?: string;
+  /** Ordered task/function arguments, including defaults and directions. */
+  readonly arguments?: readonly HdlSymbol[];
 }
 
 /** A module/interface instantiation site. */
@@ -155,6 +158,8 @@ export interface HdlScope {
    * what to look behind; the base may well live in another file.
    */
   readonly baseClass?: string;
+  /** Owner of an out-of-block implementation (`task C::run`). */
+  readonly ownerClass?: string;
   /** Packages brought into scope by an `import` statement. */
   readonly imports?: readonly PackageImport[];
 }
@@ -201,6 +206,14 @@ export interface Analysis {
    * where no scope owns them.
    */
   readonly imports: readonly PackageImport[];
+  /**
+   * Every `` `include `` in this file, in source order.
+   *
+   * What the file pulls in decides what it can see: a package named by an
+   * include is often in a folder the workspace walk never reaches, and the
+   * directive is the only thing that says so.
+   */
+  readonly includes: readonly IncludeDirective[];
   /** Class names known when this file was analysed, plus the ones it declares. */
   readonly classNames: ReadonlySet<string>;
   /**
@@ -208,6 +221,16 @@ export interface Analysis {
    * from a reference without a second pass over the tree.
    */
   readonly declarationNames: ReadonlySet<number>;
+  /**
+   * Declarations that belong to no scope: what a header leaves in the
+   * compilation unit.
+   *
+   * A shared header declares its types above the first `module`, and the file
+   * that `` `include ``s it uses them as if they were local. Nothing inside the
+   * including document declares them, so the catalog hands them over from the
+   * header's own analysis.
+   */
+  readonly unitSymbols: readonly HdlSymbol[];
 }
 
 /** An interval index over scope ranges, for O(log n) scope lookup by position. */

@@ -150,6 +150,7 @@ export function describeSymbol(symbol: HdlSymbol, options: { showType: boolean; 
 
 /** The full declaration as it would be written, used in hover and docs. */
 export function declarationText(symbol: HdlSymbol): string {
+  if (symbol.arguments) return callableLabel(symbol);
   const direction = symbol.isPort && symbol.direction ? `${symbol.direction} ` : "";
   const packed = symbol.packedRangeText ? ` [${symbol.packedRangeText}]` : "";
   const unpacked = symbol.unpackedDims.join("");
@@ -157,6 +158,15 @@ export function declarationText(symbol: HdlSymbol): string {
     symbol.initializerText && symbol.category !== "typedef" ? ` = ${symbol.initializerText}` : "";
 
   return `${direction}${symbol.typeText}${packed} ${symbol.name}${unpacked}${init}`.replace(/\s+/g, " ").trim();
+}
+
+export function argumentLabel(arg: HdlSymbol): string {
+  return [arg.direction ?? "input", arg.typeText, arg.packedRangeText ? `[${arg.packedRangeText}]` : "", arg.name + arg.unpackedDims.join("")]
+    .filter(Boolean).join(" ") + (arg.initializerText !== undefined ? ` = ${arg.initializerText}` : "");
+}
+
+export function callableLabel(symbol: HdlSymbol): string {
+  return `${symbol.category} ${symbol.category === "function" ? symbol.typeText + " " : ""}${symbol.name}(${(symbol.arguments ?? []).map(argumentLabel).join(", ")})`;
 }
 
 /** Rich hover / completion documentation for a declaration. */

@@ -1,5 +1,7 @@
 import type { Catalog, CatalogEntry } from "./catalog.js";
-import { importsInScope, type Analysis, type HdlSymbol, type PackageImport } from "./model.js";
+import { importsInScope, scopeChain, type Analysis, type HdlSymbol, type PackageImport } from "./model.js";
+import type { IncludeResolver } from "./includes.js";
+import { pathToUri, uriToPath } from "./paths.js";
 
 /**
  * Finding things that live in another file.
@@ -17,6 +19,66 @@ export interface ImportedMember {
   readonly packageName: string;
   /** File the declaration is written in, which may not be the reading one. */
   readonly uri: string;
+}
+
+/** A declaration a header pulled in, and the file that declares it. */
+export interface IncludedDeclaration {
+  readonly symbol: HdlSymbol;
+  /** File the declaration is written in, which is not the reading one. */
+  readonly uri: string;
+  /** Last path segment of that file, for hover and completion detail. */
+  readonly header: string;
+}
+
+/**
+ * The declarations `` `include ``d headers make visible, transitively.
+ *
+ * A shared header writes its types above its first module, where no scope owns
+ * them, and every file that includes it uses those names directly. The names
+ * belong to the compilation unit, so they are looked for across the whole
+ * include closure and not only in the file named on the directive -- a header
+ * that includes three more is exactly how a project lays out its types.
+ *
+ * Only names that something can be found for are returned: a header the
+ * workspace cannot reach contributes nothing, and saying so would hide a name
+ * the author really did mistype.
+ */
+export function includedDeclarations(
+  uri: string,
+  catalog: Catalog,
+  includes: IncludeResolver,
+): IncludedDeclaration[] {
+  const file = uriToPath(uri);
+  // An untitled buffer has no directory to resolve an include against, and no
+  // header to claim as its own, so every lookup below it is skipped rather than
+  // answered from the wrong file.
+  if (!file) return [];
+
+  const out: IncludedDeclaration[] = [];
+  const seen = new Set<string>();
+
+  for (const header of includes.closure(file)) {
+    const headerUri = pathToUri(header);
+    for (const symbol of catalog.unitDeclarations(headerUri)) {
+      // The first header wins: an include nearer the top of the file shadows
+      // one pulled in further down, which is what the preprocessor produces.
+      if (seen.has(symbol.name)) continue;
+      seen.add(symbol.name);
+      out.push({ symbol, uri: headerUri, header: baseNameOf(header) });
+    }
+  }
+
+  return out;
+}
+
+/** The one such declaration called `name`, if the include closure provides it. */
+export function includedDeclaration(
+  uri: string,
+  catalog: Catalog,
+  includes: IncludeResolver,
+  name: string,
+): IncludedDeclaration | undefined {
+  return includedDeclarations(uri, catalog, includes).find((entry) => entry.symbol.name === name);
 }
 
 /**
@@ -97,6 +159,8 @@ export function importedMember(
   position: number,
   name: string,
 ): ImportedMember | undefined {
+  const external = externalMembers(analysis, catalog, position).find((s) => s.symbol.name === name);
+  if (external) return external;
   for (const entry of importsInScope(analysis, position)) {
     // An explicit import names exactly one member, so a missing name here is a
     // real error and must not be looked for in the packages it re-exports.
@@ -119,7 +183,7 @@ export function importedMembers(
   catalog: Catalog,
   position: number,
 ): ImportedMember[] {
-  const out: ImportedMember[] = [];
+  const out: ImportedMember[] = externalMembers(analysis, catalog, position);
   const seen = new Set<string>();
 
   for (const entry of importsInScope(analysis, position)) {
@@ -140,4 +204,30 @@ export function importedMembers(
   }
 
   return out;
+}
+
+function externalMembers(analysis: Analysis, catalog: Catalog, position: number): ImportedMember[] {
+  const chain = scopeChain(analysis, position);
+  const implementation = chain.find((scope) => scope.ownerClass);
+  const owner = implementation?.ownerClass ?? chain.find((scope) => scope.category === "class")?.name;
+  const members = catalog.externalDeclarations(owner).map((member) => ({ ...member, packageName: owner ?? "$unit" }));
+  if (owner) members.push(...catalog.externalDeclarations().filter((m) => !members.some((own) => own.symbol.name === m.symbol.name))
+    .map((member) => ({ ...member, packageName: "$unit" })));
+  // Some out-of-block bodies omit the argument list repeated in the extern
+  // prototype. Keep the declaration's location when supplying those names.
+  const prototype = implementation ? members.find((m) => m.symbol.name === implementation.name) : undefined;
+  if (prototype) members.unshift(...(prototype.symbol.arguments ?? []).map((symbol) => ({
+    symbol, uri: prototype.uri, packageName: owner!,
+  })));
+  return members;
+}
+
+/* ------------------------------------------------------------------ *
+ * Files
+ * ------------------------------------------------------------------ */
+
+/** The last path segment of a file, for the detail lines of hover and completion. */
+function baseNameOf(file: string): string {
+  const parts = file.split("/");
+  return parts[parts.length - 1] ?? file;
 }

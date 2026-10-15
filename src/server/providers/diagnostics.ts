@@ -9,8 +9,9 @@ import type { Node } from "web-tree-sitter";
 import { widthOf, type EvalEnv } from "../eval.js";
 import { scopeChain, visibleSymbols, type Analysis } from "../model.js";
 import { enclosingReference, resolvePath } from "../hierarchy.js";
-import { importedMember } from "../imports.js";
+import { importedMember, includedDeclarations, type IncludedDeclaration } from "../imports.js";
 import type { Catalog } from "../catalog.js";
+import type { IncludeResolver } from "../includes.js";
 
 export interface DiagnosticSettings {
   enable: boolean;
@@ -70,11 +71,26 @@ export function computeDiagnostics(
   analysis: Analysis,
   catalog: Catalog,
   settings: DiagnosticSettings,
+  includes?: IncludeResolver,
 ): Diagnostic[] {
   if (!settings.enable) return [];
 
   const diagnostics: Diagnostic[] = [];
   const tree = analysis.parseTree;
+
+  // What the `` `include ``s of this file make visible, read once.
+  //
+  // The unknown-identifier rule runs per identifier, and walking the include
+  // closure each time would turn a 250-line module into hundreds of file
+  // lookups. One pass over the closure before the traversal is the whole cost.
+  const included = includes
+    ? new Map(
+        includedDeclarations(document.uri.toString(), catalog, includes).map((entry) => [
+          entry.symbol.name,
+          entry,
+        ]),
+      )
+    : undefined;
 
   const env = buildEnv(analysis);
   const assignedIn = new Map<number, Set<string>>();
@@ -104,7 +120,13 @@ export function computeDiagnostics(
     }
 
     if (node.type === "simple_identifier" && settings.unknownIdentifiers) {
-      const diagnostic = unknownDiagnostic(analysis, node, catalog, document.uri.toString());
+      const diagnostic = unknownDiagnostic(
+        analysis,
+        node,
+        catalog,
+        document.uri.toString(),
+        included,
+      );
       if (diagnostic) diagnostics.push(diagnostic);
     }
 
@@ -378,6 +400,7 @@ function unknownDiagnostic(
   node: Node,
   catalog: Catalog,
   uri: string,
+  included?: ReadonlyMap<string, IncludedDeclaration>,
 ): Diagnostic | null {
   const name = node.text;
   if (name.startsWith("$")) return null;
@@ -421,6 +444,12 @@ function unknownDiagnostic(
   if (isStructuralPosition(node)) return null;
 
   if (importedMember(analysis, catalog, node.startIndex, name)) return null;
+
+  // Declared in a header this file pulls in. A `typedef` written above the
+  // header's first module has no scope to live in, so without following the
+  // include every use of it would be reported here -- and in a file that
+  // includes three headers that is every type the design is written in.
+  if (included?.has(name)) return null;
 
   if (isDeclaredHere(analysis, name, node.startIndex)) return null;
   if (catalog.get(name)) return null;

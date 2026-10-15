@@ -2,7 +2,7 @@
   "name": "svision",
   "displayName": "SVision",
   "description": "JetBrains-grade IDE experience for SystemVerilog and Verilog: signal completion with types and widths, hover, go-to-definition, diagnostics.",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "publisher": "Nguimaraes",
   "license": "MIT",
   "engines": {

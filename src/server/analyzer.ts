@@ -16,6 +16,7 @@ import type {
   SymbolCategory,
 } from "./model.js";
 import { collectReferences } from "./signalAccess.js";
+import { readInclude, type IncludeDirective } from "./includes.js";
 import { expand, type MacroTable } from "./macros.js";
 import { iterate } from "./trees.js";
 
@@ -276,6 +277,23 @@ const ITEM_WRAPPERS = new Set([
   "statement",
   "statement_item",
   "block_statement_or_null",
+  // A task or function body. Without these, everything declared inside one is
+  // invisible: `task automatic drive; logic [7:0] a; ... endtask` opens a scope
+  // for `drive` but never walks into the body that holds it, so every local
+  // variable reads as undeclared and every call inside it is unchecked.
+  "task_body_declaration",
+  "function_body_declaration",
+  // `logic a;` inside a task arrives as `tf_item_declaration > block_item_
+  // declaration > data_declaration` in one grammar and as
+  // `block_item_declaration > data_declaration` in another, so both wrappers
+  // have to be flattened for either to be read.
+  "tf_item_declaration",
+  "function_statement_or_null",
+  "function_statement",
+  "conditional_statement",
+  "loop_statement",
+  "case_statement",
+  "case_item",
 ]);
 
 /**
@@ -397,6 +415,7 @@ interface MutableScope {
   start: number;
   end: number;
   baseClass?: string;
+  ownerClass?: string;
   imports?: PackageImport[];
 }
 
@@ -436,6 +455,17 @@ class Analyzer {
   private readonly uses: IdentifierUse[] = [];
   /** Imports outside any scope, i.e. at compilation-unit level. */
   private readonly fileImports: PackageImport[] = [];
+  /** Files this document pulls in with an `include, in source order. */
+  private readonly includes: IncludeDirective[] = [];
+  /**
+   * Declarations outside any scope: the compilation unit's own vocabulary.
+   *
+   * A header that writes `typedef struct packed {...} hdr_t;` above its first
+   * module is handing that type to every file that includes it, and there is no
+   * scope to leave it in -- the header has no module. Keeping them here is what
+   * lets the file that includes it resolve the name at all.
+   */
+  private readonly unitSymbols: PendingSymbol[] = [];
   /**
    * Class names known before this file was read, plus the ones it declares.
    *
@@ -481,6 +511,7 @@ class Analyzer {
 
     // Resolve folded constants once every scope is populated.
     for (const scope of this.scopes) this.resolveScope(scope);
+    this.resolveUnitSymbols();
 
     const scopesById = new Map<number, HdlScope>();
     const scopesByRange: ScopeIndexEntry[] = [];
@@ -504,9 +535,41 @@ class Analyzer {
       parseTree: tree,
       durationMs: Math.max(0, Date.now() - start),
       imports: this.fileImports,
+      includes: this.includes,
       classNames: this.classNames,
       declarationNames: this.declarationNames,
+      unitSymbols: this.unitSymbols as HdlSymbol[],
     };
+  }
+
+  /**
+   * Folds widths for what the compilation unit declares.
+   *
+   * The same two passes `resolveScope` runs, over a scope that exists only to be
+   * resolved: a header's `typedef logic [7:0] byte_t;` has to know its width
+   * before the file that includes it can show one.
+   */
+  private resolveUnitSymbols(): void {
+    if (this.unitSymbols.length === 0) return;
+
+    const holder: MutableScope = {
+      id: 0,
+      name: "",
+      category: "package",
+      range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+      selectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+      headerText: "",
+      parameters: [],
+      ports: [],
+      symbols: this.unitSymbols,
+      instances: [],
+      children: [],
+      depth: 0,
+      start: 0,
+      end: 0,
+    };
+
+    this.resolveScope(holder);
   }
 
   /**
@@ -581,6 +644,22 @@ class Analyzer {
     const currentScope = parentId !== undefined ? this.scopes.find((s) => s.id === parentId) : undefined;
 
     switch (node.type) {
+      case "tf_port_declaration": {
+        if (!currentScope) return;
+        const list = findChild(node, "list_of_tf_variable_identifiers");
+        const type = findChild(node, "data_type_or_implicit");
+        const split = splitPackedText(type?.text);
+        const direction = parseDirection(findChild(node, "tf_port_direction")?.text ?? "input");
+        for (const name of list ? findChildren(list, "simple_identifier") : []) {
+          this.declarationNames.add(name.id);
+          currentScope.ports.push({
+            name: name.text, category: "port", typeText: split.type || "logic",
+            packedRangeText: split.range, direction, unpackedDims: [], isPort: true,
+            scopeId: currentScope.id, range: toRange(node), selectionRange: selection(name),
+          });
+        }
+        return;
+      }
       case "parameter_declaration":
       case "local_parameter_declaration": {
         const isLocal = node.type === "local_parameter_declaration";
@@ -651,7 +730,9 @@ class Analyzer {
         const inner =
           findChild(node, "class_constructor_declaration") ??
           findChild(node, "function_declaration") ??
-          findChild(node, "task_declaration");
+          findChild(node, "task_declaration") ??
+          findChild(node, "task_prototype") ??
+          findChild(node, "function_prototype");
         if (!inner) return;
 
         const isConstructor = inner.type === "class_constructor_declaration";
@@ -683,6 +764,30 @@ class Analyzer {
         // The keyword `new` is a token, not an identifier, so there is no name
         // node to read -- and nothing to mark as a declaration.
         this.declareMethod(node, currentScope, "new", { doc: this.docBefore(node) });
+        return;
+      }
+      case "include_compiler_directive": {
+        // Which files this one pulls in. Nothing in the file can be resolved
+        // without them -- a package the include names is often in a folder the
+        // walk never reaches -- and this traversal already visits the node, so
+        // reading the directive here costs nothing extra.
+        const directive = readInclude(node);
+        if (directive) this.includes.push(directive);
+        return;
+      }
+      case "for_initialization": {
+        for (const declaration of node.namedChildren) {
+          if (declaration.type !== "for_variable_declaration") continue;
+          const type = findChild(declaration, "data_type");
+          for (const name of findChildren(declaration, "simple_identifier")) {
+            this.declarationNames.add(name.id);
+            this.declare(currentScope, {
+              name: name.text, category: "variable", typeText: type?.text ?? "int",
+              unpackedDims: [], isPort: false, scopeId: currentScope?.id ?? -1,
+              range: toRange(declaration), selectionRange: selection(name),
+            }, "variable");
+          }
+        }
         return;
       }
       case "package_import_declaration": {
@@ -746,7 +851,7 @@ class Analyzer {
     name: string,
     extras: { qualifiers?: string[]; doc?: string },
   ): void {
-    const isTask = node.type === "task_declaration";
+    const isTask = node.type === "task_declaration" || node.type === "task_prototype";
     const isConstructor = node.type === "class_constructor_declaration";
     const category: SymbolCategory = isTask ? "task" : "function";
 
@@ -757,8 +862,12 @@ class Analyzer {
       : nodeText(findDescendant(node, "data_type_or_void", 2) ?? undefined) || "void";
 
     const nameNode = scopeNameNode(node, scopeHeader(node));
+    if (nameNode) this.declarationNames.add(nameNode.id);
+    const body = findChild(node, "task_body_declaration") ?? findChild(node, "function_body_declaration");
+    const ownerNode = body ? findChild(body, "class_scope") : null;
+    const ownerClass = ownerNode?.text.replace(/::$/, "").trim();
 
-    this.declare(enclosing, {
+    const method: PendingSymbol = {
       name,
       category,
       typeText: returnType,
@@ -769,8 +878,8 @@ class Analyzer {
       selectionRange: nameNode ? selection(nameNode) : toRange(node),
       doc: extras.doc,
       ...(extras.qualifiers?.length ? { qualifiers: extras.qualifiers } : {}),
-    }, category);
-
+    };
+    const before = this.scopes.length;
     this.openScope(
       node,
       isTask ? "task" : "function",
@@ -778,6 +887,13 @@ class Analyzer {
       (enclosing?.depth ?? -1) + 1,
       name,
     );
+    const methodScope = this.scopes[before];
+    if (methodScope) {
+      methodScope.ownerClass = ownerClass;
+      (method as { arguments?: readonly HdlSymbol[] }).arguments = methodScope.ports;
+    }
+    // A qualified implementation belongs to its class, not to $unit.
+    if (!ownerClass) this.declare(enclosing, method, category);
   }
 
   /**
@@ -1102,6 +1218,9 @@ class Analyzer {
     collectLists(node, 0);
 
     for (const list of lists) {
+      let inheritedType = "logic";
+      let inheritedDirection: PortDirection = "input";
+      let inheritedRange: string | undefined;
       for (const item of list.namedChildren) {
         if (item.type !== "tf_port_item" && item.type !== "class_constructor_arg") continue;
         const portItem = item.type === "class_constructor_arg" ? findChild(item, "tf_port_item") : item;
@@ -1115,27 +1234,37 @@ class Analyzer {
 
         const typeNode = findChild(portItem, "data_type_or_implicit");
         const directionNode = findChild(portItem, "tf_port_direction");
+        if (directionNode) {
+          inheritedDirection = parseDirection(directionNode.text) ?? "input";
+          inheritedType = "logic";
+          inheritedRange = undefined;
+        }
         const packedDim = typeNode ? findDescendant(typeNode, "packed_dimension", 3) : null;
         const fromText = typeNode && !packedDim ? splitPackedText(nodeText(typeNode)) : null;
         const typeText = packedDim
           ? stripPacked(nodeText(typeNode), packedDim.text)
           : (fromText?.type ?? (typeNode ? nodeText(typeNode) : undefined) ?? "");
+        if (typeNode && typeNode.text.trim()) {
+          inheritedType = typeText || "logic";
+          inheritedRange = innerOf(packedDim ?? undefined) ?? fromText?.range;
+        }
 
         out.push({
           name: nameNode.text,
           category: "port",
-          typeText: typeText || "logic",
-          packedRangeText: innerOf(packedDim ?? undefined) ?? fromText?.range,
+          typeText: inheritedType,
+          packedRangeText: inheritedRange,
           packedRangeNode: packedDim ?? null,
           unpackedDims: portItem.namedChildren
             .filter((c) => c.type === "unpacked_dimension")
             .map((d) => d.text),
-          direction: directionNode ? parseDirection(directionNode.text) : undefined,
+          direction: inheritedDirection,
           isPort: true,
           scopeId: scope.id,
           range: toRange(portItem),
           selectionRange: selection(nameNode),
           doc: this.docBefore(portItem),
+          initializerText: portItem.text.includes("=") ? portItem.text.slice(portItem.text.indexOf("=") + 1).trim() : undefined,
         });
       }
     }
@@ -1246,8 +1375,16 @@ class Analyzer {
         findDescendant(typeSearchRoot, "net_port_type", 3) ??
         findDescendant(typeSearchRoot, "net_type", 3);
 
-      // A new direction resets the inherited type.
-      if (directionNode) {
+      // `bus_if.slave bus` -- a port whose type is an interface, optionally
+      // through a modport. The type is the whole header, because `bus.data`
+      // has to know which interface `bus` is before it can find `data`; a port
+      // with no type recorded is exactly the port that cannot be followed.
+      if (headerNode?.type === "interface_port_header") {
+        inheritedDirection = undefined;
+        inheritedTypeText = headerNode.text;
+        inheritedPackedRange = undefined;
+        inheritedPackedNode = null;
+      } else if (directionNode) {
         inheritedDirection = parseDirection(directionNode.text);
         inheritedTypeText = undefined;
         inheritedPackedRange = undefined;
@@ -1797,7 +1934,13 @@ class Analyzer {
 
   private declare(scope: MutableScope | undefined, sym: PendingSymbol, category: SymbolCategory): void {
     const full: PendingSymbol = { ...sym, category };
-    if (!scope) return;
+    // No scope means the declaration belongs to the compilation unit -- a header
+    // above its first module, or a `typedef` written before any design unit at
+    // all. Dropping it is what made every use of an included type unknown.
+    if (!scope) {
+      this.unitSymbols.push(full);
+      return;
+    }
     if (category === "parameter" || category === "localparam") {
       scope.parameters.push(full as HdlSymbol);
     } else {

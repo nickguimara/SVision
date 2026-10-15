@@ -7,7 +7,8 @@ import type { Analysis } from "../model.js";
 import { identifierAt } from "../locate.js";
 import { declarationText, describeSymbol, documentationFor } from "../symbolFormatting.js";
 import { pathOf, resolvePath } from "../hierarchy.js";
-import { importedMember } from "../imports.js";
+import { importedMember, includedDeclaration } from "../imports.js";
+import type { IncludeResolver } from "../includes.js";
 
 export interface HoverSettings {
   showWidth: boolean;
@@ -20,6 +21,7 @@ export function provideHover(
   catalog: Catalog,
   offset: number,
   settings: HoverSettings,
+  includes?: IncludeResolver,
 ): Hover | null {
   const node = identifierAt(analysis, offset);
   if (!node) return null;
@@ -84,6 +86,27 @@ export function provideHover(
         ].join("\n"),
       },
     };
+  }
+
+  // A type declared in a header this file `` `include ``s. Written above the
+  // header's first module, so no scope owns it and only the include says where
+  // it lives.
+  if (includes) {
+    const declared = includedDeclaration(document.uri, catalog, includes, name);
+    if (declared) {
+      const doc = documentationFor(declared.symbol, { ...settings, usageCount: 1 });
+      return {
+        contents: {
+          kind: "markdown",
+          value: [
+            doc.value,
+            "",
+            `Declared in \`${declared.header}\` at line ` +
+              `${declared.symbol.selectionRange.start.line + 1}, included by this file.`,
+          ].join("\n"),
+        },
+      };
+    }
   }
 
   // A module / interface / package reference.

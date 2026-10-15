@@ -177,7 +177,12 @@ export class ToolViews implements vscode.Disposable {
     if (this.state.uri === uri && this.state.module) return;
 
     this.state.uri = uri;
-    const module = await this.client.sendRequest<string | null>("svision/moduleAt", { uri });
+    const module = (await this.client.sendRequest<string | null>("svision/moduleAt", { uri })) ??
+      // A header or a package declares no module, so the file alone cannot say
+      // where it sits. The project's top is what reaches the rest of the
+      // design, and it is the only answer available for a file like that.
+      (await this.client.sendRequest<{ top: { name: string } | null }>("svision/designTop", { uri }))?.top
+        ?.name;
     if (!module) return;
 
     await this.showLevel(module, [module], uri);

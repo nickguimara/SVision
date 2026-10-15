@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -116,6 +116,15 @@ describe("language server (built bundle)", () => {
   before(async () => {
     workspace = await mkdtemp(path.join(tmpdir(), "svision-smoke-"));
     await writeFile(path.join(workspace, "child.sv"), "module child #(parameter int W = 8) (input wire clk); endmodule\n");
+    await mkdir(path.join(workspace, "interfaces"));
+    await mkdir(path.join(workspace, "api"));
+    await writeFile(path.join(workspace, "interfaces/stream.sv"), "interface stream_if; logic [7:0] data; endinterface\n");
+    await writeFile(path.join(workspace, "api/test.svh"), [
+      "class dsp_test;",
+      " virtual stream_if vif;",
+      " extern task generate_triangle_wave(input int samples, output int value);",
+      "endclass", "",
+    ].join("\n"));
     uri = `file://${workspace}/counter.sv`;
 
     // The extension host normally launches the server over IPC; the language
@@ -134,6 +143,7 @@ describe("language server (built bundle)", () => {
     assert.ok(result.capabilities.completionProvider, "completion should be advertised");
     assert.ok(result.capabilities.hoverProvider, "hover should be advertised");
     assert.ok(result.capabilities.definitionProvider, "definition should be advertised");
+    assert.ok(result.capabilities.signatureHelpProvider, "argument hints should be advertised");
 
     client.notify("initialized", {});
     client.notify("textDocument/didOpen", {
@@ -247,4 +257,217 @@ describe("language server (built bundle)", () => {
     const missing = await client.request("svision/moduleAt", { uri: "file:///nope.sv" });
     assert.equal(missing, null);
   });
+
+  it("names the module the design hangs from", async () => {
+    const answer = await client.request("svision/designTop", { uri });
+
+    assert.ok(answer, "the request answers with a top and the roots it saw");
+    // `counter` is instantiated by nothing and `child` by nothing either, but
+    // `counter` is the file being edited, so it is the top the caller asked for.
+    assert.equal(answer.top.name, "counter");
+    assert.ok(answer.top.reach >= 1);
+    assert.ok(Array.isArray(answer.roots));
+  });
+
+  it("keeps the same top when asked twice", async () => {
+    const first = await client.request("svision/designTop", { uri });
+    const second = await client.request("svision/designTop", { uri });
+
+    assert.deepEqual(second.top, first.top, "the answer is cached, not recomputed per request");
+  });
+
+  it("resolves an external task body and advertises its argument hints over LSP", async () => {
+    const bodyUri = `file://${workspace}/implementation.sv`;
+    const text = [
+      "task automatic dsp_test::generate_triangle_wave(input int samples, output int value);",
+      " int temporary;",
+      " temporary = samples;",
+      " value = temporary;",
+      " vif.data = temporary;",
+      " generate_triangle_wave(2, value);",
+      "endtask", "",
+    ].join("\n");
+    client.notify("textDocument/didOpen", {
+      textDocument: { uri: bodyUri, languageId: "systemverilog", version: 1, text },
+    });
+    const findings = await waitForCleanDiagnostics(client, bodyUri);
+    assert.deepEqual(findings, []);
+    const definition = await client.request("textDocument/definition", {
+      textDocument: { uri: bodyUri }, position: { line: 4, character: 6 },
+    });
+    assert.equal(definition.uri, `file://${workspace}/interfaces/stream.sv`);
+    const help = await client.request("textDocument/signatureHelp", {
+      textDocument: { uri: bodyUri }, position: { line: 5, character: " generate_triangle_wave(2, ".length },
+    });
+    assert.equal(help.activeParameter, 1);
+    assert.match(help.signatures[0].label, /input int samples, output int value/);
+  });
 });
+
+/**
+ * The case that reads like a bug report: one `.sv` file opened on its own, with
+ * the package it uses sitting in a folder the editor has no other reason to
+ * look at. Nothing here is in a workspace folder, so the folder walk sees only
+ * `rtl/` -- the `include` is the only thing that names `pkgs/cfg_pkg.svh`.
+ */
+describe("a package reached only through an include", () => {
+  const HEADER = [
+    "`ifndef CFG_SVH",
+    "`define CFG_SVH",
+    "typedef logic [7:0] word_t;",
+    "package cfg_pkg;",
+    "  parameter int WIDTH = 32;",
+    "endpackage",
+    "`endif",
+    "",
+  ].join("\n");
+
+  const USER = [
+    '`include "../pkgs/cfg_pkg.svh"',
+    "module datapath;",
+    "  word_t w;",
+    "  localparam int TOTAL = cfg_pkg::WIDTH;",
+    "endmodule",
+    "",
+  ].join("\n");
+
+  let client;
+  let child;
+  let uri;
+  let headerUri;
+
+  before(async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), "svision-loose-"));
+    await mkdir(path.join(workspace, "rtl"), { recursive: true });
+    await mkdir(path.join(workspace, "pkgs"), { recursive: true });
+    await writeFile(path.join(workspace, "pkgs/cfg_pkg.svh"), HEADER, "utf8");
+    await writeFile(path.join(workspace, "pkgs/more.svh"), "typedef logic [3:0] nib_t;\n", "utf8");
+    await writeFile(path.join(workspace, "rtl/datapath.sv"), USER, "utf8");
+
+    uri = `file://${workspace}/rtl/datapath.sv`;
+    headerUri = `file://${workspace}/pkgs/cfg_pkg.svh`;
+
+    child = spawn(process.execPath, [serverEntry, "--stdio"], { stdio: ["pipe", "pipe", "pipe"] });
+    client = new Client(child);
+
+    // What the extension host sends for a file opened without a folder: no
+    // workspace at all, and the folder of the document as the only hint.
+    await client.request("initialize", {
+      processId: process.pid,
+      rootUri: null,
+      capabilities: {},
+      initializationOptions: { workspaceFolder: path.join(workspace, "rtl") },
+      workspaceFolders: null,
+    });
+
+    client.notify("initialized", {});
+    client.notify("textDocument/didOpen", {
+      textDocument: { uri, languageId: "systemverilog", version: 1, text: USER },
+    });
+  });
+
+  after(async () => {
+    try {
+      await client?.request("shutdown", null);
+      client?.notify("exit");
+    } catch {
+      /* server already gone */
+    }
+    child?.kill();
+  });
+
+  it("reports nothing for a name the included header declares", async () => {
+    // The diagnostics arrive twice: once from the first analysis, and again once
+    // the header has been read. The finding that must not survive is the unknown
+    // identifier.
+    const findings = await waitForCleanDiagnostics(client, uri);
+
+    assert.deepEqual(
+      findings.map((d) => d.message),
+      [],
+      "word_t and cfg_pkg::WIDTH both resolve once the include is followed",
+    );
+  });
+
+  it("jumps to a declaration made in the header", async () => {
+    const marker = USER.indexOf("word_t w") + "word_t".length - 1;
+    const before = USER.slice(0, marker);
+
+    const definition = await client.request("textDocument/definition", {
+      textDocument: { uri },
+      position: { line: before.split("\n").length - 1, character: marker - before.lastIndexOf("\n") - 1 },
+    });
+
+    assert.ok(definition, "the declaration in the header is reachable");
+    assert.equal(definition.uri, headerUri);
+  });
+
+  it("hovers a type declared in the header", async () => {
+    const marker = USER.indexOf("word_t w") + "word_t".length - 1;
+    const before = USER.slice(0, marker);
+
+    const hover = await client.request("textDocument/hover", {
+      textDocument: { uri },
+      position: { line: before.split("\n").length - 1, character: marker - before.lastIndexOf("\n") - 1 },
+    });
+
+    assert.ok(hover, "hover should answer");
+    assert.match(hover.contents.value, /cfg_pkg\.svh/);
+  });
+
+  it("follows an include the author just typed", async () => {
+    // The folder was walked at startup, so no new walk happens for this file.
+    // What has to notice the new line is the document itself, which is why the
+    // includes are read from the tree the editor already produced.
+    const edited = [
+      '`include "../pkgs/cfg_pkg.svh"',
+      '`include "../pkgs/more.svh"',
+      "module datapath;",
+      "  word_t w;",
+      "  nib_t n;",
+      "  localparam int TOTAL = cfg_pkg::WIDTH;",
+      "endmodule",
+      "",
+    ].join("\n");
+
+    const seen = diagnosticsFor(client, uri).length;
+    client.notify("textDocument/didChange", {
+      textDocument: { uri, version: 2 },
+      contentChanges: [{ text: edited }],
+    });
+
+    const findings = await waitForCleanDiagnostics(client, uri, seen);
+    assert.deepEqual(
+      findings.map((d) => d.message),
+      [],
+      "nib_t is declared in a header that did not exist when the file was opened",
+    );
+  });
+});
+
+/** The diagnostics published for `uri` so far, oldest first. */
+function diagnosticsFor(client, uri) {
+  return client.notifications
+    .filter((n) => n.method === "textDocument/publishDiagnostics" && n.params.uri === uri)
+    .map((n) => n.params.diagnostics);
+}
+
+/**
+ * Waits until the newest diagnostics for `uri` are empty.
+ *
+ * The publication list is cumulative on purpose. An edit reaches the server
+ * before the header it names has been read, so the findings arrive first and the
+ * corrected ones after; waiting for the newest rather than the first is what
+ * makes this a test of the whole round trip instead of of its first half.
+ */
+async function waitForCleanDiagnostics(client, uri, since = 0, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    const all = diagnosticsFor(client, uri);
+    const newest = all[all.length - 1] ?? [];
+    if (all.length > since && newest.length === 0) return newest;
+    if (Date.now() >= deadline) return newest;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}

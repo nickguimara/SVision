@@ -25,9 +25,12 @@ import type {
 import { Catalog } from "./catalog.js";
 import { DocumentManager } from "./documentManager.js";
 import { VerilogParser } from "./verilogParser.js";
+import { IncludeResolver } from "./includes.js";
+import { TopResolver, type TopUnit } from "./top.js";
 import { DEFAULT_INDEX_OPTIONS, WorkspaceIndexer } from "./workspaceIndex.js";
 import { completionContext, provideCompletion, type CompletionSettings } from "./providers/completion.js";
 import { provideHover } from "./providers/hover.js";
+import { provideSignatureHelp } from "./callables.js";
 import { provideDefinition, provideReferences } from "./providers/definition.js";
 import { provideDocumentSymbols } from "./providers/documentSymbols.js";
 import { moduleOfSignal, traceSignal, type TraceHop } from "./trace.js";
@@ -50,9 +53,30 @@ interface ServerOptions {
 /** How long to wait after the last keystroke before running diagnostics. */
 const DIAGNOSTIC_DEBOUNCE_MS = 250;
 
+/** How long to wait after the last keystroke before following an `include`. */
+const INCLUDE_DEBOUNCE_MS = 400;
+
 const connection: Connection = createConnection(ProposedFeatures.all);
 
 const catalog = new Catalog();
+
+/**
+ * Shared by every indexer the server builds.
+ *
+ * The handshake may replace the indexer with one configured from the client's
+ * settings, and a resolver of its own would start out knowing no files -- which
+ * would undo the includes resolved during the first pass.
+ */
+const includes = new IncludeResolver();
+
+/**
+ * Which module the design hangs from.
+ *
+ * Held for the life of the session and rebuilt only when the design changes,
+ * which is what the structure version inside the catalog is for: the answer
+ * cannot depend on which file happens to be open.
+ */
+const tops = new TopResolver(catalog);
 
 /** Created once the grammar is loaded; every handler reads through it. */
 let documents: DocumentManager;
@@ -78,6 +102,10 @@ const diagnosticSettings: DiagnosticSettings = {
 
 const pendingDiagnostics = new Map<string, NodeJS.Timeout>();
 
+/** Documents whose `include`s still have to be resolved and read. */
+const pendingIncludeFollows = new Set<string>();
+let includeTimer: NodeJS.Timeout | undefined;
+
 /* ------------------------------------------------------------------ *
  * Lifecycle
  * ------------------------------------------------------------------ */
@@ -92,7 +120,7 @@ async function main(): Promise<void> {
   const parser = await VerilogParser.create();
 
   documents = new DocumentManager(parser);
-  indexer = new WorkspaceIndexer(parser, catalog, DEFAULT_INDEX_OPTIONS);
+  indexer = new WorkspaceIndexer(parser, catalog, DEFAULT_INDEX_OPTIONS, includes);
 
   // Analysis needs the workspace's class names to tell `Packet pkt;` from a
   // one-bit net, and the catalog is what holds them.
@@ -111,6 +139,8 @@ async function main(): Promise<void> {
   connection.onShutdown(() => {
     for (const timer of pendingDiagnostics.values()) clearTimeout(timer);
     pendingDiagnostics.clear();
+    if (includeTimer) clearTimeout(includeTimer);
+    pendingIncludeFollows.clear();
     parser.dispose();
   });
 
@@ -121,11 +151,16 @@ function registerInitialize(parser: VerilogParser): void {
   connection.onInitialize((params: InitializeParams): InitializeResult => {
     const options = (params.initializationOptions ?? {}) as ServerOptions;
     if (options.index) {
-      indexer = new WorkspaceIndexer(parser, catalog, {
-        include: options.index.include ?? DEFAULT_INDEX_OPTIONS.include,
-        exclude: options.index.exclude ?? DEFAULT_INDEX_OPTIONS.exclude,
-        maxFiles: options.index.maxFiles ?? DEFAULT_INDEX_OPTIONS.maxFiles,
-      });
+      indexer = new WorkspaceIndexer(
+        parser,
+        catalog,
+        {
+          include: options.index.include ?? DEFAULT_INDEX_OPTIONS.include,
+          exclude: options.index.exclude ?? DEFAULT_INDEX_OPTIONS.exclude,
+          maxFiles: options.index.maxFiles ?? DEFAULT_INDEX_OPTIONS.maxFiles,
+        },
+        includes,
+      );
     }
 
     const sync: TextDocumentSyncOptions = {
@@ -142,9 +177,10 @@ function registerInitialize(parser: VerilogParser): void {
         // `(` a connection list, and space reopens the list after a keyword
         // such as `assign`. The response for an empty prefix is small and
         // stable, so triggering on space does not make it flicker.
-        triggerCharacters: [".", "#", "(", " "],
+        triggerCharacters: [".", ":", "#", "(", " "],
       },
       hoverProvider: true,
+      signatureHelpProvider: { triggerCharacters: ["(", ","], retriggerCharacters: [")"] },
       definitionProvider: true,
       referencesProvider: true,
       documentHighlightProvider: true,
@@ -155,7 +191,7 @@ function registerInitialize(parser: VerilogParser): void {
     // Indexing runs after the handshake so the editor stays responsive.
     void indexWorkspace(params);
 
-    return { capabilities, serverInfo: { name: "svision", version: "0.2.0" } };
+    return { capabilities, serverInfo: { name: "svision", version: "0.2.3" } };
   });
 }
 
@@ -179,9 +215,69 @@ function refreshOpenDocuments(): void {
   for (const entry of documents.all()) {
     const updated = documents.reanalyze(entry.document.uri);
     if (!updated) continue;
-    catalog.replaceDocument(updated.document.uri, updated.analysis.scopes, updated.analysis.accesses);
+    indexOpenDocument(updated.document.uri);
     scheduleDiagnostics(updated.document.uri, true);
   }
+}
+
+/**
+ * Records what an open document contributes to the workspace, and resolves the
+ * includes it writes.
+ *
+ * The directives come from the analysis the document manager already produced,
+ * rather than from another pass over the tree: they are needed on every
+ * keystroke, and walking the tree a second time to find lines that rarely change
+ * is exactly the cost this is meant to avoid.
+ */
+function indexOpenDocument(uri: string): void {
+  const entry = documents.get(uri);
+  if (!entry) return;
+
+  catalog.replaceDocument(uri, entry.analysis.scopes, entry.analysis.accesses, entry.analysis.unitSymbols);
+  indexer.followIncludes(uri, entry.analysis.includes);
+}
+
+/**
+ * Reads the headers an open document's includes name.
+ *
+ * With no workspace folder open the walk only ever sees the folder of the file
+ * that was opened, and the package it pulls in is usually a couple of folders
+ * away -- so `cfg_pkg::WIDTH` has nothing to resolve against. Reading what the
+ * document itself asks for closes that gap, and it stays bounded by the
+ * document: one lookup per include directive, over files whose paths a human
+ * wrote down.
+ *
+ * Debounced, because the only thing that changes it is an edit, and a line of
+ * text being typed should not turn into a filesystem walk. Several documents
+ * edited in quick succession share one pass.
+ */
+function scheduleIncludeFollow(uri: string): void {
+  pendingIncludeFollows.add(uri);
+  if (includeTimer) return;
+
+  includeTimer = setTimeout(() => {
+    includeTimer = undefined;
+    const uris = [...pendingIncludeFollows];
+    pendingIncludeFollows.clear();
+
+    void (async () => {
+      for (const target of uris) {
+        indexer.followIncludes(target, documents.get(target)?.analysis.includes ?? []);
+      }
+      const reached = await indexer.indexReachedIncludes();
+      if (reached === 0) return;
+
+      connection.console.log(
+        `[svision] read ${reached} header(s) reached by an \`include from ${uris.join(", ")}`,
+      );
+      // Those documents were analysed before their headers were in the catalog.
+      refreshOpenDocuments();
+      // Reading a file teaches the resolver about it, which can turn an earlier
+      // "not found" into a hit -- so the report is reissued rather than left
+      // claiming a header is missing when it is not.
+      reportMissingIncludes();
+    })();
+  }, INCLUDE_DEBOUNCE_MS);
 }
 
 async function indexWorkspace(params: InitializeParams): Promise<void> {
@@ -234,13 +330,67 @@ async function indexWorkspace(params: InitializeParams): Promise<void> {
     const shown = [...indexer.undefinedMacros.keys()].slice(0, 20);
     connection.console.log(
       `[svision] ${indexer.undefinedMacros.size} macro(s) are called but not defined in the workspace ` +
-        `(include paths are not followed): ${shown.join(", ")}` +
+        `(the header that defines them was not reached): ${shown.join(", ")}` +
         (shown.length < indexer.undefinedMacros.size ? ", ..." : ""),
     );
   }
 
   // Anything already on screen was analysed without this catalog.
   refreshOpenDocuments();
+
+  // An include the editor could not place is a missing file, and nothing else
+  // in the session would say so: every type and macro it declared simply is not
+  // there, and the symptom points at the extension rather than at the file list.
+  reportMissingIncludes();
+
+  reportDesignTop();
+}
+
+/**
+ * Names the includes that resolved to nothing, and who asks for them.
+ *
+ * The counterpart to the undefined-macro report. A macro is missing because its
+ * file could not be reached; the include says which file that was, so the two
+ * together turn "this type is unknown" into "you are missing `defines.svh`".
+ */
+function reportMissingIncludes(): void {
+  const missing = includes.missing;
+  if (missing.size === 0) return;
+
+  const shown = [...missing.entries()].slice(0, 20);
+  const format = ([target, askers]: [string, ReadonlySet<string>]): string =>
+    `${target} (from ${[...askers].slice(0, 3).map(baseNameOfUri).join(", ")})`;
+
+  connection.console.log(
+    `[svision] ${missing.size} \`include name(s) could not be found in the workspace: ` +
+      shown.map(format).join(", ") +
+      (shown.length < missing.size ? ", ..." : "") +
+      " (each one was searched beside the including file, in the folders above it, " +
+      "at every workspace root and by name across the whole project)",
+  );
+}
+
+function baseNameOfUri(uri: string): string {
+  const parts = uri.split(/[\\/]/);
+  return parts[parts.length - 1] ?? uri;
+}
+
+/**
+ * Logs the module the design hangs from.
+ *
+ * Read once here so the number in the log is the one the sidebar uses, and so a
+ * project whose top is not the module the user happens to have open still has
+ * one place that says what the design is.
+ */
+function reportDesignTop(): void {
+  const top = tops.top();
+  if (!top) return;
+
+  const others = tops.roots().filter((root) => root.name !== top.name);
+  connection.console.log(
+    `[svision] design top: ${top.name} (${top.reach} design unit(s) below it)` +
+      (others.length > 0 ? `; also a root: ${others.map((root) => root.name).join(", ")}` : ""),
+  );
 }
 
 /**
@@ -250,6 +400,10 @@ async function indexWorkspace(params: InitializeParams): Promise<void> {
  * workspace folder open, `initialize` had nothing to scan, so
  * `cfg_pkg::WIDTH` had no `cfg_pkg` to resolve against until the user happened
  * to open a folder.
+ *
+ * The folder on its own is not enough. A package kept in `../pkg/` is not beside
+ * the file that uses it, which is why the document's own includes are followed
+ * as well -- the include names the file, and nothing else does.
  */
 function indexFolderOf(uri: string): void {
   const decoded = decodeFileUri(uri);
@@ -259,11 +413,14 @@ function indexFolderOf(uri: string): void {
   if (indexedRoots.has(folder)) return;
 
   indexedRoots.add(folder);
-  void indexer.indexFolders([folder]).then((count) => {
+  void indexer.indexFolders([folder]).then(async (count) => {
     connection.console.log(`[svision] indexed ${folder} after it was opened (${count} file(s))`);
     // Same reason as the startup pass: this document was analysed before the
     // package sitting next to it was in the catalog.
     refreshOpenDocuments();
+    scheduleIncludeFollow(uri);
+    reportMissingIncludes();
+    reportDesignTop();
   });
 }
 
@@ -284,8 +441,9 @@ function registerDocumentHandlers(): void {
       event.textDocument.text,
     );
     const entry = documents.update(document.uri, document);
-    catalog.replaceDocument(entry.document.uri, entry.analysis.scopes, entry.analysis.accesses);
+    indexOpenDocument(entry.document.uri);
     indexFolderOf(document.uri);
+    scheduleIncludeFollow(entry.document.uri);
     scheduleDiagnostics(entry.document.uri);
   });
 
@@ -303,7 +461,10 @@ function registerDocumentHandlers(): void {
     );
 
     const entry = documents.update(document.uri, document);
-    catalog.replaceDocument(entry.document.uri, entry.analysis.scopes, entry.analysis.accesses);
+    indexOpenDocument(entry.document.uri);
+    // A line of `include just typed names a file nothing has read yet, and the
+    // folder walk is long over.
+    scheduleIncludeFollow(entry.document.uri);
     // The whole-design list has to stay in step with the catalog, because its
     // checks read port directions from it.
     scheduleDiagnostics(entry.document.uri);
@@ -321,6 +482,7 @@ function registerDocumentHandlers(): void {
     }
     connection.sendDiagnostics({ uri: event.textDocument.uri, diagnostics: [] });
     documents.close(event.textDocument.uri);
+    indexer.forgetDocument(event.textDocument.uri);
     // The catalog entry stays: the file still exists on disk.
   });
 
@@ -373,7 +535,13 @@ function scheduleDiagnostics(uri: string, immediate = false): void {
     pendingDiagnostics.delete(uri);
     const entry = documents.get(uri);
     if (!entry) return;
-    const items = computeDiagnostics(entry.document, entry.analysis, catalog, diagnosticSettings);
+    const items = computeDiagnostics(
+      entry.document,
+      entry.analysis,
+      catalog,
+      diagnosticSettings,
+      includes,
+    );
     connection.sendDiagnostics({ uri, diagnostics: items });
   };
 
@@ -392,6 +560,10 @@ function entryAt(params: TextDocumentPositionParams) {
 }
 
 function registerLanguageHandlers(): void {
+  connection.onSignatureHelp((params) => {
+    const found = entryAt(params);
+    return found ? provideSignatureHelp(found.entry.document, found.entry.analysis, catalog, found.offset, includes) : null;
+  });
   // One level of the RTL viewer: the submodule blocks of a module, the nets
   // between them, and the breadcrumb back up to the top.
   // Drivers and loads of one signal, followed across module boundaries.
@@ -448,7 +620,36 @@ connection.onRequest("svision/navigator", (request: { uri: string }) => {
   return buildNavigator(entry.analysis);
 });
 
-/** Module names available in the workspace, for the viewer's entry points. */
+/**
+   * Which module the project hangs from.
+   *
+   * Answered from the catalog's instantiation graph and kept until the design
+   * changes, so asking twice costs nothing. A file with no module of its own --
+   * a header, a package -- is answered with the top that reaches the rest, which
+   * is the only way to place it in the design at all.
+   */
+  connection.onRequest(
+    "svision/designTop",
+    (request: { uri?: string; module?: string }): { top: TopUnit | null; roots: TopUnit[] } => {
+      const roots = tops.roots();
+
+      if (request.module) {
+        const owner = tops.topOf(request.module);
+        return { top: owner ?? roots[0] ?? null, roots };
+      }
+
+      if (request.uri) {
+        const entry = documents.get(request.uri);
+        const own = entry?.analysis.scopes.find((scope) => scope.category === "module")?.name;
+        const owner = own ? tops.topOf(own, request.uri) : undefined;
+        if (owner) return { top: owner, roots };
+      }
+
+      return { top: roots[0] ?? null, roots };
+    },
+  );
+
+  /** Module names available in the workspace, for the viewer's entry points. */
   connection.onRequest("svision/designUnits", () =>
     catalog.units().map((e) => ({
       name: e.name,
@@ -462,22 +663,29 @@ connection.onRequest("svision/navigator", (request: { uri: string }) => {
     const found = entryAt(params);
     if (!found) return { isIncomplete: false, items: [] };
     const context = completionContext(found.entry.document, found.entry.analysis, found.offset);
-    return provideCompletion(context, documents, catalog, completionSettings);
+    return provideCompletion(context, documents, catalog, completionSettings, includes);
   });
 
   connection.onHover((params) => {
     const found = entryAt(params);
     if (!found) return null;
-    return provideHover(found.entry.document, found.entry.analysis, catalog, found.offset, {
-      showWidth: completionSettings.showWidth,
-      showType: completionSettings.showType,
-    });
+    return provideHover(
+      found.entry.document,
+      found.entry.analysis,
+      catalog,
+      found.offset,
+      {
+        showWidth: completionSettings.showWidth,
+        showType: completionSettings.showType,
+      },
+      includes,
+    );
   });
 
   connection.onDefinition((params) => {
     const found = entryAt(params);
     if (!found) return null;
-    return provideDefinition(found.entry.document, found.entry.analysis, catalog, found.offset);
+    return provideDefinition(found.entry.document, found.entry.analysis, catalog, found.offset, includes);
   });
 
   connection.onReferences((params: ReferenceParams) => {

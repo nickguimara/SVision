@@ -30,6 +30,8 @@ import { pathOf, resolvePath } from "../src/server/hierarchy.js";
 import { identifierAt } from "../src/server/locate.js";
 import { emptyTrace, traceTree, unknownSignal } from "../src/client/toolsHtml.js";
 import { DEFAULT_INDEX_OPTIONS, pathToUri, WorkspaceIndexer } from "../src/server/workspaceIndex.js";
+import { type IncludeDirective, IncludeResolver } from "../src/server/includes.js";
+import { TopResolver } from "../src/server/top.js";
 import { isUsableUri } from "../src/client/uris.js";
 
 const zeroRange = () => ({
@@ -51,6 +53,17 @@ let parser: VerilogParser;
 before(async () => {
   parser = await VerilogParser.create();
 });
+
+/**
+ * The `` `include ``s a document writes, as the analyser reads them.
+ *
+ * They are read from the same traversal as everything else, so a test asking
+ * what a file pulls in asks it through the analysis rather than through a
+ * second pass over the tree.
+ */
+function directivesOf(source: string): IncludeDirective[] {
+  return [...analyzeTree(parser.parse(source), source).includes];
+}
 
 interface Fixture {
   readonly analysis: ReturnType<typeof analyzeTree>;
@@ -5365,5 +5378,473 @@ describe("undefined macros", () => {
     });
 
     assert.deepEqual([...indexer.undefinedMacros.keys()], []);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The module a design hangs from
+ * ------------------------------------------------------------------ */
+
+/**
+ * The top of a design is a property of the workspace, not of the file being
+ * edited, so it is searched once and kept. What makes that safe is the catalog's
+ * structure version: a renamed signal must not invalidate it, and a new
+ * submodule must.
+ */
+describe("the design's top module", () => {
+  const TOP = ["module soc_top;", "  alu u_alu ();", "  dma u_dma ();", "endmodule", ""].join("\n");
+  const ALU = ["module alu;", "  adder u_add ();", "endmodule", ""].join("\n");
+  const ADDER = "module adder; endmodule\n";
+  const DMA = "module dma; endmodule\n";
+  /** A second root that reaches nothing of its own: an empty wrapper. */
+  const TB = "module tb; endmodule\n";
+
+  /** A catalog holding `files`, indexed the way the workspace indexer does. */
+  const catalogOf = (files: Record<string, string>, catalog = new Catalog()): Catalog => {
+    for (const [name, source] of Object.entries(files)) {
+      const analysis = analyzeTree(parser.parse(source), source);
+      catalog.replaceDocument(pathToUri(name), analysis.scopes, analysis.accesses, analysis.unitSymbols);
+    }
+    return catalog;
+  };
+
+  it("names the module nobody instantiates", () => {
+    const tops = new TopResolver(catalogOf({ "/p/soc_top.sv": TOP, "/p/alu.sv": ALU, "/p/adder.sv": ADDER }));
+
+    assert.deepEqual(
+      tops.roots().map((root) => root.name),
+      ["soc_top"],
+    );
+  });
+
+  it("says how much of the design hangs from it", () => {
+    const tops = new TopResolver(
+      catalogOf({ "/p/soc_top.sv": TOP, "/p/alu.sv": ALU, "/p/adder.sv": ADDER }),
+    );
+
+    assert.equal(tops.top()?.reach, 3, "soc_top, alu and adder");
+  });
+
+  it("prefers the root that reaches the rest of the design", () => {
+    const tops = new TopResolver(
+      catalogOf({ "/p/soc_top.sv": TOP, "/p/alu.sv": ALU, "/p/adder.sv": ADDER, "/p/tb.sv": TB }),
+    );
+
+    assert.equal(tops.top()?.name, "soc_top");
+    assert.deepEqual(
+      tops.roots().map((root) => root.name),
+      ["soc_top", "tb"],
+      "every root is reported, widest first",
+    );
+  });
+
+  it("puts a testbench above the design it drives", () => {
+    // A testbench instantiates the whole design, so it reaches more of the
+    // project than any module does. That is the rule, not an accident: the top
+    // is whichever root has everything else under it.
+    const bench = ["module tb;", "  soc_top u_dut ();", "endmodule", ""].join("\n");
+    const tops = new TopResolver(
+      catalogOf({ "/p/soc_top.sv": TOP, "/p/alu.sv": ALU, "/p/adder.sv": ADDER, "/p/tb.sv": bench }),
+    );
+
+    assert.equal(tops.top()?.name, "tb");
+    assert.equal(tops.topOf("adder")?.name, "tb");
+  });
+
+  it("places a submodule in the top that reaches it", () => {
+    const tops = new TopResolver(
+      catalogOf({ "/p/soc_top.sv": TOP, "/p/alu.sv": ALU, "/p/adder.sv": ADDER }),
+    );
+
+    assert.equal(tops.topOf("adder")?.name, "soc_top");
+    assert.equal(tops.topOf("soc_top")?.name, "soc_top");
+  });
+
+  it("does not offer a package as a top", () => {
+    const catalog = catalogOf({
+      "/p/soc_top.sv": TOP,
+      "/p/alu.sv": ALU,
+      "/p/cfg.sv": "package cfg_pkg;\n  parameter int W = 8;\nendpackage\n",
+    });
+
+    assert.deepEqual(
+      new TopResolver(catalog).roots().map((root) => root.name),
+      ["soc_top"],
+    );
+  });
+
+  it("terminates on a module that instantiates itself", () => {
+    const tops = new TopResolver(
+      catalogOf({ "/p/loop.sv": ["module loop;", "  loop u_self ();", "endmodule", ""].join("\n") }),
+    );
+
+    assert.deepEqual(
+      tops.roots().map((root) => root.name),
+      [],
+      "a module that instantiates itself is not a root",
+    );
+  });
+
+  describe("caching", () => {
+    it("keeps the answer across a keystroke", () => {
+      const catalog = catalogOf({ "/p/soc_top.sv": TOP, "/p/alu.sv": ALU });
+      const tops = new TopResolver(catalog);
+      const before = tops.top();
+      const version = catalog.structureVersion;
+
+      // The same module, with one more signal: the design has not changed.
+      const edited = TOP.replace("endmodule", "  logic [7:0] scratch;\nendmodule");
+      const analysis = analyzeTree(parser.parse(edited), edited);
+      catalog.replaceDocument(pathToUri("/p/soc_top.sv"), analysis.scopes, analysis.accesses);
+
+      assert.equal(catalog.structureVersion, version, "a renamed signal is not a design change");
+      assert.strictEqual(tops.top(), before, "the cached answer is reused, not rebuilt");
+    });
+
+    it("rebuilds when the design changes", () => {
+      const catalog = catalogOf({ "/p/soc_top.sv": TOP, "/p/alu.sv": ALU });
+      const tops = new TopResolver(catalog);
+      const before = tops.top();
+
+      // A new submodule, in a file the index has read: the design grew, so the
+      // answer has to be recomputed rather than served from the cache.
+      const extended = TOP.replace("endmodule", "  uart u_uart ();\nendmodule");
+      const analysis = analyzeTree(parser.parse(extended), extended);
+      catalog.replaceDocument(pathToUri("/p/soc_top.sv"), analysis.scopes, analysis.accesses);
+      catalogOf({ "/p/uart.sv": "module uart; endmodule\n" }, catalog);
+
+      assert.notStrictEqual(tops.top(), before, "a new submodule invalidates the cache");
+      assert.equal(tops.top()?.reach, before!.reach + 1, "uart now hangs from soc_top");
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Where an `include` points
+ * ------------------------------------------------------------------ */
+
+describe("include paths", () => {
+  const CFG = [
+    "`ifndef CFG_SVH",
+    "`define CFG_SVH",
+    "typedef logic [7:0] word_t;",
+    "package cfg_pkg;",
+    "  parameter int WIDTH = 32;",
+    "endpackage",
+    "`endif",
+    "",
+  ].join("\n");
+
+  const TOP = [
+    "`include \"../pkgs/cfg_pkg.svh\"",
+    "module soc_top;",
+    "  word_t w;",
+    "  localparam int W = cfg_pkg::WIDTH;",
+    "endmodule",
+    "",
+  ].join("\n");
+
+  const diagnose = (
+    document: TextDocument,
+    analysis: ReturnType<typeof analyzeTree>,
+    catalog: Catalog,
+    includes: IncludeResolver,
+  ) =>
+    computeDiagnostics(
+      document,
+      analysis,
+      catalog,
+      {
+        enable: true,
+        unknownIdentifiers: true,
+        widthMismatch: false,
+        blockingInSequential: false,
+        implicitSensitivity: false,
+        latchDetection: false,
+      },
+      includes,
+    );
+
+  /** A workspace on disk, with only `indexed` folders walked. */
+  const build = async (files: Record<string, string>, indexed: string[]) => {
+    const root = mkdtempSync(path.join(tmpdir(), "svision-include-"));
+    for (const [name, text] of Object.entries(files)) {
+      const absolute = path.join(root, name);
+      mkdirSync(path.dirname(absolute), { recursive: true });
+      writeFileSync(absolute, text, "utf8");
+    }
+
+    const catalog = new Catalog();
+    const includes = new IncludeResolver();
+    const indexer = new WorkspaceIndexer(parser, catalog, DEFAULT_INDEX_OPTIONS, includes);
+    await indexer.indexFolders(indexed.map((name) => path.join(root, name)));
+
+    return { root, catalog, includes, indexer };
+  };
+
+  it("reads both spellings of a directive", () => {
+    const source = ['`include "a.svh"', "`include <b.svh>", "module m; endmodule", ""].join("\n");
+    const directives = directivesOf(source);
+
+    assert.deepEqual(
+      directives.map((directive) => [directive.target, directive.systemLib]),
+      [
+        ["a.svh", false],
+        ["b.svh", true],
+      ],
+    );
+  });
+
+  it("finds a header two folders up", async () => {
+    const { root, includes } = await build({ "pkgs/cfg_pkg.svh": CFG, "rtl/top.sv": TOP }, ["rtl"]);
+
+    const source = TOP;
+    const resolved = includes.noteIncludes(path.join(root, "rtl/top.sv"), directivesOf(source));
+
+    assert.deepEqual(
+      resolved.map((edge) => edge.absolute),
+      [path.join(root, "pkgs/cfg_pkg.svh")],
+    );
+  });
+
+  it("reads a header the folder walk never entered", async () => {
+    // Only `rtl/` is indexed, and the package lives outside it -- which is the
+    // whole point: with no workspace folder open, this is every folder the
+    // editor knows about. The include is the only thing that names the file.
+    const { root, catalog } = await build({ "pkgs/cfg_pkg.svh": CFG, "rtl/top.sv": TOP }, ["rtl"]);
+
+    const packageEntry = catalog.get("cfg_pkg");
+    assert.ok(packageEntry, "a package reached only by an include reaches the catalog");
+    assert.equal(
+      packageEntry.uri,
+      pathToUri(path.join(root, "pkgs/cfg_pkg.svh")),
+      "and it is the file the include named, not a folder the walk covered",
+    );
+  });
+
+  it("reads the headers of a file opened outside every indexed folder", async () => {
+    const loose = ["`include \"../pkgs/cfg_pkg.svh\"", "module loose_top;", "  word_t w;", "endmodule", ""].join("\n");
+    const { root, catalog, includes, indexer } = await build(
+      { "pkgs/cfg_pkg.svh": CFG, "elsewhere/loose.sv": loose },
+      [],
+    );
+
+    const uri = pathToUri(path.join(root, "elsewhere/loose.sv"));
+    // What `didOpen` does: the document's own tree is the only place its
+    // includes are known, and nothing has walked the folder it lives in.
+    indexer.followIncludes(uri, directivesOf(loose));
+    const reached = await indexer.indexReachedIncludes();
+
+    assert.equal(reached, 1);
+    assert.ok(catalog.get("cfg_pkg"));
+    assert.ok(includes.closure(path.join(root, "elsewhere/loose.sv")).length > 0);
+  });
+
+  it("resolves the types a header declares in the file that includes it", async () => {
+    const { root, catalog, includes, indexer } = await build(
+      { "pkgs/cfg_pkg.svh": CFG, "rtl/top.sv": TOP },
+      ["rtl"],
+    );
+
+    const uri = pathToUri(path.join(root, "rtl/top.sv"));
+    indexer.followIncludes(uri, directivesOf(TOP));
+    await indexer.indexReachedIncludes();
+
+    const analysis = analyzeTree(parser.parse(TOP), TOP, catalog.classNames());
+    const document = TextDocument.create(uri, "systemverilog", 1, TOP);
+
+    assert.deepEqual(
+      diagnose(document, analysis, catalog, includes).map((d) => d.message),
+      [],
+      "word_t and cfg_pkg::WIDTH are both declared",
+    );
+  });
+
+  it("jumps to a declaration made in a header", async () => {
+    const { root, catalog, includes, indexer } = await build(
+      { "pkgs/cfg_pkg.svh": CFG, "rtl/top.sv": TOP },
+      ["rtl"],
+    );
+
+    const uri = pathToUri(path.join(root, "rtl/top.sv"));
+    indexer.followIncludes(uri, directivesOf(TOP));
+    await indexer.indexReachedIncludes();
+
+    const analysis = analyzeTree(parser.parse(TOP), TOP, catalog.classNames());
+    const document = TextDocument.create(uri, "systemverilog", 1, TOP);
+
+    const at = TOP.indexOf("word_t w") + "word_t".length - 1;
+    const target = provideDefinition(document, analysis, catalog, at, includes) as { uri: string };
+
+    assert.equal(target.uri, pathToUri(path.join(root, "pkgs/cfg_pkg.svh")));
+  });
+
+  it("looks through a header that includes another header", async () => {
+    const outer = ['`include "base/defines.svh"', "typedef logic [3:0] nib_t;", ""].join("\n");
+    const inner = ["typedef logic [7:0] word_t;", ""].join("\n");
+    const user = [
+      "`include \"../pkgs/cfg.svh\"",
+      "module m;",
+      "  word_t w;",
+      "  nib_t n;",
+      "endmodule",
+      "",
+    ].join("\n");
+
+    const { root, catalog, includes, indexer } = await build(
+      { "pkgs/base/defines.svh": inner, "pkgs/cfg.svh": outer, "rtl/user.sv": user },
+      ["rtl"],
+    );
+
+    const uri = pathToUri(path.join(root, "rtl/user.sv"));
+    indexer.followIncludes(uri, directivesOf(user));
+    await indexer.indexReachedIncludes();
+
+    assert.deepEqual(
+      includes.closure(path.join(root, "rtl/user.sv")).map((file) => path.basename(file)).sort(),
+      ["cfg.svh", "defines.svh"],
+      "the closure follows the chain",
+    );
+
+    const analysis = analyzeTree(parser.parse(user), user, catalog.classNames());
+    const document = TextDocument.create(uri, "systemverilog", 1, user);
+
+    assert.deepEqual(diagnose(document, analysis, catalog, includes).map((d) => d.message), []);
+  });
+
+  it("offers a header's types in completion", async () => {
+    const { root, catalog, includes, indexer } = await build(
+      { "pkgs/cfg_pkg.svh": CFG, "rtl/top.sv": TOP },
+      ["rtl"],
+    );
+
+    const uri = pathToUri(path.join(root, "rtl/top.sv"));
+    indexer.followIncludes(uri, directivesOf(TOP));
+    await indexer.indexReachedIncludes();
+
+    const analysis = analyzeTree(parser.parse(TOP), TOP, catalog.classNames());
+    const document = TextDocument.create(uri, "systemverilog", 1, TOP);
+
+    const offset = TOP.indexOf("  word_t w;") + 2;
+    const context = completionContext(document, analysis, offset);
+    const list = provideCompletion(
+      context,
+      new DocumentManager(parser),
+      catalog,
+      {
+        showWidth: true,
+        showType: true,
+        snippets: false,
+        systemFunctions: false,
+        includeParameters: true,
+      },
+      includes,
+    );
+
+    assert.ok(
+      list.items.some((item) => item.label === "word_t"),
+      "a type from an included header completes",
+    );
+  });
+
+  it("does not resolve an angle-bracketed include beside the file", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "svision-include-angle-"));
+    mkdirSync(path.join(root, "rtl"), { recursive: true });
+    mkdirSync(path.join(root, "lib"), { recursive: true });
+    // The same name in two places: `<...>` is a library include, so the copy
+    // next to the file must not win -- that is what tells them apart.
+    writeFileSync(path.join(root, "lib/dut.svh"), "package lib_pkg;\nendpackage\n", "utf8");
+    writeFileSync(path.join(root, "rtl/dut.svh"), "package wrong_pkg;\nendpackage\n", "utf8");
+    writeFileSync(path.join(root, "rtl/top.sv"), "`include <dut.svh>\nmodule top; endmodule\n", "utf8");
+
+    const catalog = new Catalog();
+    const includes = new IncludeResolver();
+    const indexer = new WorkspaceIndexer(parser, catalog, DEFAULT_INDEX_OPTIONS, includes);
+    await indexer.indexFolders([path.join(root, "lib")]);
+
+    const resolved = includes.noteIncludes(
+      path.join(root, "rtl/top.sv"),
+      directivesOf("`include <dut.svh>\nmodule top; endmodule\n"),
+    );
+
+    assert.deepEqual(
+      resolved.map((edge) => edge.absolute),
+      [path.join(root, "lib/dut.svh")],
+    );
+  });
+
+  it("names an include nothing can be found for", async () => {
+    const { root, includes } = await build(
+      { "rtl/top.sv": ["`include \"vendor/std_cells.svh\"", "module top; endmodule", ""].join("\n") },
+      ["rtl"],
+    );
+
+    includes.noteIncludes(
+      path.join(root, "rtl/top.sv"),
+      directivesOf("`include \"vendor/std_cells.svh\"\nmodule top; endmodule\n"),
+    );
+
+    assert.ok(includes.missing.has("vendor/std_cells.svh"));
+    assert.ok([...includes.missing.get("vendor/std_cells.svh")!].some((file) => file.endsWith("top.sv")));
+  });
+
+  it("does not guess between two headers of the same name", async () => {
+    const { root, includes } = await build(
+      {
+        "a/defines.svh": "`define A 1\n",
+        "b/defines.svh": "`define B 2\n",
+        "rtl/top.sv": "`include \"missing/defines.svh\"\nmodule top; endmodule\n",
+      },
+      ["a", "b"],
+    );
+
+    const resolved = includes.noteIncludes(
+      path.join(root, "rtl/top.sv"),
+      directivesOf("`include \"missing/defines.svh\"\nmodule top; endmodule\n"),
+    );
+
+    assert.deepEqual(resolved, [], "an ambiguous name resolves to nothing rather than to one of them");
+    assert.ok(includes.missing.has("missing/defines.svh"));
+  });
+
+  it("finds a header by its path anywhere in the project", async () => {
+    const { root, includes } = await build(
+      { "vendor/lib/cfg_pkg.svh": CFG, "rtl/top.sv": TOP },
+      ["vendor", "rtl"],
+    );
+
+    // Written as `lib/cfg_pkg.svh`, but the file sits under `vendor/`. No
+    // folder on the way up holds it, and the include itself does not say
+    // `vendor/` -- which is the case the search across indexed files exists for.
+    const resolved = includes.noteIncludes(
+      path.join(root, "rtl/top.sv"),
+      directivesOf("`include \"lib/cfg_pkg.svh\"\nmodule top; endmodule\n"),
+    );
+
+    assert.deepEqual(
+      resolved.map((edge) => edge.absolute),
+      [path.join(root, "vendor/lib/cfg_pkg.svh")],
+    );
+  });
+
+  it("answers a bare name only when the project holds one file of it", async () => {
+    const { root, includes } = await build(
+      { "pkgs/cfg_pkg.svh": CFG, "rtl/top.sv": TOP },
+      ["rtl"],
+    );
+
+    // `cfg_pkg.svh` with no folder in it, written from `rtl/`. The package is
+    // not beside the file and the ascent does not reach it -- what answers is
+    // the fact that the project holds exactly one file of that name, which is
+    // what an include path would do.
+    const resolved = includes.noteIncludes(
+      path.join(root, "rtl/top.sv"),
+      directivesOf("`include \"cfg_pkg.svh\"\nmodule top; endmodule\n"),
+    );
+
+    assert.deepEqual(
+      resolved.map((edge) => edge.absolute),
+      [path.join(root, "pkgs/cfg_pkg.svh")],
+    );
   });
 });

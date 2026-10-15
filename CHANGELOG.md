@@ -4,6 +4,92 @@ Todas as mudanças relevantes deste projeto são anotadas aqui.
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/) e
 o versionamento segue [SemVer](https://semver.org/lang/pt-BR/).
 
+## [0.2.3] — Resolução entre arquivos, interfaces e rotinas
+
+### Interfaces e rotinas entre arquivos
+
+- Correção da resolução de portas de interface com modport, interfaces virtuais
+  e chamadas de métodos por caminhos hierárquicos; navegação aponta para o arquivo
+  que declara o membro, inclusive em métodos herdados.
+- Leitura de protótipos `extern task/function` e ligação dos corpos
+  `task automatic Classe::metodo(...)` aos membros da classe em outro arquivo.
+- Travessia dos corpos de tasks/functions, declarações locais, variáveis de `for`,
+  argumentos não-ANSI e herança de tipo/direção em listas de argumentos ANSI.
+- Resolução de chamadas a rotinas de compilação-unidade em outros arquivos.
+- Completion com campos editáveis para os argumentos, sugestões de argumentos
+  nomeados e suporte LSP a signature help em `(` e `,`, com argumento ativo,
+  direções, tipos e valores padrão. Hover também apresenta a assinatura.
+
+### Corrigido
+
+- **O `include` passou a ser seguido de verdade, e o caminho dele resolvido.**
+  Um `` `include "pkg/cfg_pkg.svh" `` é uma *string*, não um caminho: nada no
+  workspace diz se ela é relativa ao arquivo que a escreve, à raiz do projeto, ou
+  um nome que só existe numa biblioteca de fornecedor. Um compilador recebe
+  `+incdir+` e uma file list; o editor não recebia nada, e por isso um pacote em
+  `../pkgs/` ficava invisível — `cfg_pkg::WIDTH` não tinha contra o que resolver,
+  e todo parâmetro do módulo aparecia como desconhecido.
+  - O nome é procurado na ordem em que um compilador procuraria: **ao lado do
+    arquivo que inclui**, **subindo até quatro pastas**, **na raiz de cada
+    workspace** e, por fim, **pelo caminho relativo em qualquer arquivo já
+    indexado do projeto** (o mais raso vence) ou pelo nome de arquivo, quando
+    existe exatamente um.
+  - `` `include <...> `` **nunca** é procurado ao lado do arquivo: um include de
+    biblioteca não é relativo a quem o escreve, e procurar lá transforma uma cópia
+    local na versão da biblioteca.
+  - **O arquivo alcançado pelo include entra no índice**, mesmo estando numa pasta
+    que a varredura nunca visitou — que é justamente o caso de um `.sv` aberto
+    sem workspace folder, onde a única pasta que o editor conhece é a do próprio
+    arquivo. As dependências são lidas antes de qualquer análise, como a varredura
+    já faz, para a resposta não depender da ordem.
+  - A cadeia é seguida inteira: um cabeçalho que inclui três outros é comum, e é
+    bem no mais distante que a declaração costuma estar. Passadas ilimitadas por
+    profundidade real, com um limite.
+  - **Um include que não resolve é nomeado no log**, junto com quem o pede. É a
+    diferença entre "a ferramenta quebrou" e "falta `std_cells.svh`", e o sintoma
+    — todo macro daquele arquivo parecendo não declarado — aponta para a extensão
+    em vez do file list.
+  - Um include **digitado agora** também é seguido: a pasta já foi varrida faz
+    tempo, e a linha nova é a única coisa que nomeia o arquivo. Isso é
+    debounceado junto com o resto do trabalho de tecla.
+- **O que um cabeçalho declara acima do primeiro `module` deixou de ser
+  descartado.** `typedef struct packed {...} hdr_t;` e os literais de um `enum`
+  escritos no topo de um `.svh` são a compilação-unidade entregada a quem o
+  inclui, e não pertencem a nenhum escopo — o arquivo do cabeçalho não tem módulo
+  onde guardá-los. Eram jogados fora, então todo uso daquele tipo no arquivo que
+  inclui era um identificador desconhecido, sem hover e sem ir para definição.
+  - Eles ficam no catálogo por arquivo, e chegam ao arquivo que inclui pelo
+    **fecho transitivo** do include: hover, ir para definição, completion e o
+    diagnóstico de identificador desconhecido passam a enxergá-los.
+- **O pacote não precisa mais estar na mesma pasta que o arquivo.** A descoberta
+  automática indexava a pasta do arquivo aberto; o include agora cobre o resto,
+  e o caminho do pacote é resolvido em qualquer pasta do projeto.
+
+### Adicionado
+
+- **O módulo topo de cada projeto, com cache.** O módulo que ninguém instancia e
+  cuja árvore de instanciação alcança o resto é o ponto de entrada do design — é o
+  que o RTL viewer deve abrir, e é a única resposta possível para um arquivo sem
+  módulo próprio (um cabeçalho, um pacote).
+  - Escolhido entre as raízes pelo que alcança: um testbench que instancia o
+    design inteiro é o topo, porque de fato alcança tudo. Todas as raízes são
+    listadas, da mais larga para a mais estreita.
+  - **A busca acontece uma vez e a resposta fica guardada.** O que a mantém
+    correta é a nova versão estrutural do catálogo: uma assinatura de unidade
+    (nome, tipo, o que ela instancia) é o desenho; renomear um sinal não é. Uma
+    tecla não refaz a busca; instanciar um módulo novo, sim.
+  - `svision/designTop` responde pelo topo, e o cliente o usa quando o arquivo
+    aberto não declara módulo nenhum.
+  - Módulo que instancia a si mesmo não é raiz, e um `package` ou uma `class`
+    nunca é topo.
+
+### Desempenho
+
+- As diretivas de `include` são lidas da árvore que o editor já parseou, não de
+  um parse novo, e a resolução de um nome é memorizada enquanto o conjunto de
+  arquivos conhecidos é o mesmo. Um miss é refeito assim que o índice aprende
+  mais um arquivo — o cabeçalho pode simplesmente ainda não ter sido lido.
+
 ## [0.2.1] — Macros de texto, na forma como o RTL as escreve
 
 ### Adicionado

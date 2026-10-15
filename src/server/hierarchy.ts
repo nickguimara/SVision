@@ -3,6 +3,7 @@ import type { Node } from "web-tree-sitter";
 
 import type { Catalog, CatalogEntry } from "./catalog.js";
 import { scopeChain, type Analysis, type HdlScope, type HdlSymbol } from "./model.js";
+import { importedMember } from "./imports.js";
 
 /**
  * Following a dotted name across the design hierarchy.
@@ -172,6 +173,16 @@ function collect(node: Node, into: PathSegment[]): void {
 
   const head = node.namedChildren[0];
   if (!head) return;
+  if (["tf_call", "subroutine_call_statement", "subroutine_call", "function_subroutine_call", "constant_function_call"].includes(node.type)) {
+    collect(head, into);
+    return;
+  }
+  // A dotted task/function call is wrapped in tf_call; its first child is
+  // the path, while the remaining children are arguments, not path segments.
+  if (node.type !== "select" && head.type === "hierarchical_identifier") {
+    collect(head, into);
+    return;
+  }
 
   if (node.type === "select") {
     // `a[expr]` -- `name` is the array, the index selects an element of it.
@@ -213,6 +224,26 @@ function collect(node: Node, into: PathSegment[]): void {
       end: { line: head.endPosition.row, character: head.endPosition.column },
     },
   });
+}
+
+/**
+ * The interface a port's or variable's type names, when it names one.
+ *
+ * `bus_if.slave bus` records the type as `bus_if.slave`: the interface plus the
+ * modport the port is declared through. Following `bus.data` needs the
+ * interface, so the modport is dropped and the trailing name is looked up --
+ * `pkg::bus_if` is legal too, and only the last segment is the interface name.
+ *
+ * Returns undefined for anything that is not an interface, because the same
+ * question is asked of every port and most of them are plain nets.
+ */
+export function interfaceOfType(typeText: string, catalog: Catalog): CatalogEntry | undefined {
+  const last = typeText.replace(/^virtual\s+(?:interface\s+)?/, "")
+    .replace(/\s*#\s*\([^]*\)/, "").trim().split("::").pop()?.split(".")[0]?.trim();
+  if (!last) return undefined;
+
+  const candidates = catalog.all(last).filter((entry) => entry.kind === "interface");
+  return candidates[0];
 }
 
 /**
@@ -348,6 +379,12 @@ function walkPath(
 
   // --- the first segment names something visible from here -------------------
   const head = segments[0]!;
+  if (head.name === "this" || head.name === "super") {
+    const owner = chain.find((s) => s.ownerClass)?.ownerClass ?? chain.find((s) => s.category === "class")?.name;
+    let entry = owner ? catalog.resolve(owner) : undefined;
+    if (head.name === "super") entry = entry?.baseClass ? catalog.resolve(entry.baseClass) : undefined;
+    if (entry) return intoEntry(entry, segments, 1, catalog, false, head.name);
+  }
 
   // An instance of a module, interface or package: the rest of the path is
   // inside it.
@@ -365,7 +402,7 @@ function walkPath(
 
   // A local declaration. `Packet pkt;` then `pkt.payload` needs the catalog to
   // say what `Packet` holds, because the class usually lives in another file.
-  const local = visibleInChain(chain, head.name);
+  const local = visibleInChain(chain, head.name) ?? importedMember(analysis, catalog, offset, head.name)?.symbol;
   if (local) {
     if (segments.length === 1) return { symbol: local, uri: documentUri, viaInterface: false };
 
@@ -373,6 +410,12 @@ function walkPath(
       const entry = catalog.resolve(local.handleOf);
       if (entry) return intoEntry(entry, segments, 1, catalog, false, head.name);
     }
+
+    // A port or variable of interface type: `bus_if.slave bus` then `bus.data`.
+    // Nothing else in the chain can answer for it -- it is not an instance, it
+    // is a name bound to a foreign scope by its declared type.
+    const iface = interfaceOfType(local.typeText, catalog);
+    if (iface) return intoEntry(iface, segments, 1, catalog, true, head.name);
   }
 
   // A package or class named directly, for `cfg_pkg::WIDTH`.
@@ -449,20 +492,24 @@ function intoEntry(
 
   // A subclass sees its base's members, so a class lookup has to follow
   // `extends` rather than reading only what the class itself declares.
+  const inherited = entry.kind === "class" ? catalog.externalDeclarations(entry.name).find((s) => s.symbol.name === member.name) : undefined;
   const symbol =
     entry.kind === "class"
-      ? catalog.classMembers(entry.name).find((s) => s.name === member.name)
+      ? inherited?.symbol
       : findInEntry(entry, member.name);
   if (!symbol) {
     // The scope was reached; the name inside it is simply not there.
     return notFound(member.name, viaInterface);
   }
 
-  const resolved: ResolvedPath = { symbol, uri: entry.uri, viaInterface, instance };
+  const resolved: ResolvedPath = { symbol, uri: inherited?.uri ?? entry.uri, viaInterface, instance };
 
   // Still more path left: keep descending through nested instances.
   const next = segments[from + 1];
   if (!next) return resolved;
+
+  const memberType = symbol.handleOf ? catalog.resolve(symbol.handleOf) : interfaceOfType(symbol.typeText, catalog);
+  if (memberType) return intoEntry(memberType, segments, from + 1, catalog, memberType.kind === "interface", member.name);
 
   const nested = entry.instances.find((i) => i.instanceName === member.name);
   if (nested) {

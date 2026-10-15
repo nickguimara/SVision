@@ -79,6 +79,32 @@ export class Catalog {
   private readonly byName = new Map<string, CatalogEntry[]>();
   /** uri -> names declared by that document, so removal is exact. */
   private readonly byUri = new Map<string, string[]>();
+  /**
+   * uri -> declarations that belong to no scope, i.e. what a header leaves
+   * behind in the compilation unit.
+   *
+   * `typedef struct {...} hdr_t;` and the literals of an `enum` written above
+   * the first `module` are visible to every unit in the file that includes the
+   * header. No scope owns them, so nothing else can be asked where they are.
+   */
+  private readonly unitSymbols = new Map<string, readonly HdlSymbol[]>();
+  /** uri -> the shape of what the document declares, to spot a real change. */
+  private readonly shapes = new Map<string, string>();
+  /**
+   * Bumped only when a document's *shape* changes.
+   *
+   * A design unit's name, its kind and what it instantiates are the structure
+   * the workspace answers questions about; a renamed signal is not. Anything
+   * cached against the workspace -- the top of the design, which module reaches
+   * which -- is keyed on this, so a keystroke costs nothing and a new submodule
+   * costs one rebuild.
+   */
+  private version = 0;
+
+  /** Changes whenever the design itself does. See `version`. */
+  get structureVersion(): number {
+    return this.version;
+  }
 
   /**
    * Rebuilds the entries contributed by a single document.
@@ -88,8 +114,19 @@ export class Catalog {
    * therefore a separate pass: this method only records what the document says,
    * and `resolveAll` rebuilds every entry's accesses from the finished index.
    */
-  replaceDocument(uri: string, scopes: HdlScope[], accesses: readonly SignalAccess[] = []): void {
-    this.removeDocument(uri);
+  replaceDocument(
+    uri: string,
+    scopes: HdlScope[],
+    accesses: readonly SignalAccess[] = [],
+    unitSymbols: readonly HdlSymbol[] = [],
+  ): void {
+    this.removeEntries(uri);
+
+    const shape = shapeOf(scopes);
+    if (this.shapes.get(uri) !== shape) {
+      this.shapes.set(uri, shape);
+      this.version++;
+    }
 
     const declared: string[] = [];
 
@@ -117,6 +154,8 @@ export class Catalog {
     }
 
     this.byUri.set(uri, declared);
+    if (unitSymbols.length > 0) this.unitSymbols.set(uri, unitSymbols);
+    else this.unitSymbols.delete(uri);
     this.source.set(uri, { accesses, scopes });
     this.resolveAll();
   }
@@ -203,6 +242,13 @@ export class Catalog {
   }
 
   removeDocument(uri: string): void {
+    this.removeEntries(uri);
+    this.unitSymbols.delete(uri);
+    if (this.shapes.delete(uri)) this.version++;
+  }
+
+  /** Drops the entries a document contributed, leaving everything else intact. */
+  private removeEntries(uri: string): void {
     this.source.delete(uri);
     for (const name of this.byUri.get(uri) ?? []) {
       const list = this.byName.get(name);
@@ -212,6 +258,34 @@ export class Catalog {
       else this.byName.set(name, kept);
     }
     this.byUri.delete(uri);
+  }
+
+  /**
+   * What a document leaves in the compilation unit, for the file that includes
+   * it.
+   *
+   * A header is not a design unit, so this is the only way a `typedef` written
+   * above the first `module` can be found -- and without it every use of that
+   * type in the including file is an unknown identifier, which is exactly what a
+   * package or a shared header looks like from the outside.
+   */
+  unitDeclarations(uri: string): readonly HdlSymbol[] {
+    return this.unitSymbols.get(uri) ?? [];
+  }
+
+  /** Compilation-unit routines and members visible inside C::method bodies. */
+  externalDeclarations(owner?: string): { symbol: HdlSymbol; uri: string }[] {
+    if (owner) {
+      const entry = this.resolve(owner);
+      if (!entry) return [];
+      return this.classMembers(owner).map((symbol) => ({
+        symbol,
+        uri: this.units().find((unit) => unit.symbols.includes(symbol) || unit.parameters.includes(symbol))?.uri ?? entry.uri,
+      }));
+    }
+    return [...this.unitSymbols].flatMap(([uri, symbols]) =>
+      symbols.filter((s) => s.category === "task" || s.category === "function").map((symbol) => ({ symbol, uri })),
+    );
   }
 
   /** First declaration of `name`, used when a single target is expected. */
@@ -303,11 +377,11 @@ all(name: string): CatalogEntry[] {
     if (!entry || seen.has(className)) return [];
     seen.add(className);
 
-    const own = [...entry.symbols];
+    const own = [...entry.parameters, ...entry.symbols];
     const inherited = entry.baseClass ? this.classMembers(entry.baseClass, seen) : [];
 
     // The subclass declaration shadows the base's, which is what SV says.
-    return [...own.filter((s) => !inherited.some((b) => b.name === s.name)), ...inherited];
+    return [...own, ...inherited.filter((s) => !own.some((local) => local.name === s.name))];
   }
 
   /**
@@ -330,4 +404,25 @@ all(name: string): CatalogEntry[] {
     for (const list of this.byName.values()) out.push(...list);
     return out;
   }
+}
+
+/**
+ * What a document declares, as one comparable string.
+ *
+ * Only the parts that can change the shape of the design are read: which units
+ * exist, and which modules each one instantiates. Everything else a file declares
+ * -- signals, widths, bodies -- leaves this string untouched, which is what
+ * keeps a keystroke from invalidating the workspace-wide answers built on top of
+ * it.
+ */
+function shapeOf(scopes: readonly HdlScope[]): string {
+  const parts: string[] = [];
+
+  for (const scope of scopes) {
+    if (!UNIT_KINDS.has(scope.category)) continue;
+    parts.push(`${scope.category} ${scope.name}`);
+    for (const instance of scope.instances) parts.push(`${scope.name} > ${instance.typeName}`);
+  }
+
+  return parts.join("\n");
 }

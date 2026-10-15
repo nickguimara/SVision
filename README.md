@@ -58,6 +58,21 @@ Funciona dentro do arquivo e entre arquivos: um nome de módulo, interface ou
 package é resolvido pelo índice do workspace. Clicar em `.port(...)` de uma
 instanciação leva à declaração daquela porta no módulo instanciado.
 
+### Interfaces, tasks e funções entre arquivos
+
+- Interfaces indexadas em outras pastas podem ser usadas por instâncias,
+  portas com modport (`bus_if.sink bus`) e interfaces virtuais. Seus membros
+  aparecem no completion e são alcançados por hover e ir para definição.
+- Protótipos `extern task/function` são reconhecidos. Corpos como
+  `task automatic dsp_test::generate_triangle_wave(...)` enxergam os membros
+  da classe declarada em outro arquivo, inclusive métodos e interfaces virtuais.
+- Declarações locais, argumentos ANSI/não-ANSI e variáveis de `for` são lidos
+  nos corpos de tasks/functions. Rotinas de pacote, de cabeçalhos incluídos e
+  de compilação-unidade indexadas podem ser resolvidas em chamadas entre arquivos.
+- Ao completar uma rotina, a extensão insere os argumentos como campos editáveis.
+  Ao digitar `(` ou `,`, mostra a assinatura e destaca o argumento atual.
+  Chamadas com argumentos nomeados (`.argumento(...)`) também têm sugestões.
+
 ### Diagnósticos
 
 Todos configuráveis individualmente:
@@ -231,6 +246,9 @@ src/
     model.ts                 modelo de dados e resolução de escopo
     catalog.ts               índice de módulos do workspace
     workspaceIndex.ts        varredura de disco e globbing
+    includes.ts              resolução do caminho de cada `include
+    top.ts                   módulo topo do design, com cache
+    paths.ts                 tradução entre caminho e `file://`
     locate.ts                nó/identificador sob o cursor
     symbolFormatting.ts      hover e completion a partir dos símbolos
     completionData.ts        keywords, snippets e funções de sistema
@@ -260,7 +278,7 @@ via `require.resolve` a partir do `node_modules` da extensão.
 | `svision.diagnostics.blockingInSequential` | `true` | `=` dentro de `always_ff` |
 | `svision.diagnostics.implicitSensitivity` | `true` | Lista de sensibilidade incompleta |
 | `svision.diagnostics.latchDetection` | `true` | Inferência de latch |
-| `svision.index.include` | `**/*.{sv,svh,v,vh}` | Arquivos entram no índice |
+| `svision.index.include` | `**/*.{sv,svh,svp,v,vh}` | Arquivos entram no índice |
 | `svision.index.exclude` | `node_modules`, `.git`, … | Arquivos ignorados pelo índice |
 | `svision.trace.server` | `off` | Log de comunicação LSP |
 
@@ -376,7 +394,18 @@ O parsing usa a gramática **SystemVerilog 1800-2023** do
    mesmo se `AW` vier antes de `DEPTH`.
 4. Resolve a largura empacotada de cada sinal a partir da árvore, caindo para o
    texto quando necessário.
-5. Indexa módulos e interfaces de todo o workspace para navegação cross-file.
+5. Indexa módulos e interfaces de todo o workspace para navegação cross-file,
+   seguindo os `include` que a varredura não alcança — um pacote em `../pkgs/` é
+   nomeado pelo include, e o include é a única coisa que diz onde ele está.
+6. Resolve cada `include` na ordem em que um compilador procuraria: ao lado do
+   arquivo, subindo as pastas, na raiz do workspace e, por fim, pelo caminho
+   relativo em qualquer arquivo do projeto. `<...>` nunca é procurado ao lado do
+   arquivo, porque não é relativo a ele. Um include que não resolve é nomeado no
+   log, junto com os macros que ele traria.
+7. Encontra o módulo topo do design — o que ninguém instancia e alcança o resto —
+   e guarda a resposta até o desenho mudar. O cache é invalidado por uma versão
+   estrutural do catálogo: renomear um sinal não o invalida, instanciar um
+   módulo sim.
 
 A avaliação de constantes é deliberadamente conservadora: quando um valor não
 pode ser-determinado com certeza, a largura é omitida em vez de estimada. Uma
@@ -390,8 +419,12 @@ problemas em ruído.
 ## Limitações conhecidas
 
 - Não há modelo de tipos completo: não resolve `typedef` composed, `interface`
-  com `modport` acessado por `ifc.sig`, pacotes importados (`pkg::NAME`) nem
-  parâmetros sobrescritos na instanciação. Nesses casos a largura aparece vazia.
+  com `modport` acessado por `ifc.sig` nem parâmetros sobrescritos na
+  instanciação. Nesses casos a largura aparece vazia.
+- O `include` só é seguido por nome: um caminho escrito dentro de uma macro
+  (`` `include `HEADERS/defines.svh ``) não é resolvido, porque o valor da macro
+  não vem do fonte. Um include com nome ambíguo (dois `defines.svh` no projeto)
+  também não é resolvido — escolher um seria adivinhar.
 - Portas não-ANSI (`module m(a, b); input a;`) ainda não são resolvidas.
 - A inferência de latch não considera laços nem `case` com `unique`/`priority`.
 - Nenhuma formatação automática ainda (apenas indentação nativa do VS Code).
