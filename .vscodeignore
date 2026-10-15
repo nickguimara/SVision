@@ -1,0 +1,41 @@
+.vscode/**
+.gitignore
+build.mjs
+build.config.mjs
+build-tests.mjs
+start.mjs
+tsconfig.json
+test/**
+sample/**
+src/**
+out-test/**
+**/*.map
+**/*.ts
+
+# The language server resolves its parser through require.resolve at runtime,
+# so node_modules has to ship -- but only the part it actually opens.
+#
+# tree-sitter-systemverilog alone is 222MB unpacked: 135MB of native prebuilds
+# for every platform and 64MB of C sources, none of which this extension uses.
+# It loads exactly one file, the .wasm, which is 22MB.
+node_modules/tree-sitter-systemverilog/prebuilds/**
+node_modules/tree-sitter-systemverilog/src/**
+node_modules/tree-sitter-systemverilog/bindings/**
+node_modules/tree-sitter-systemverilog/grammar.js
+node_modules/tree-sitter-systemverilog/queries/**
+
+# The debug build of the wasm runtime ships alongside the release one.
+node_modules/web-tree-sitter/debug/**
+node_modules/web-tree-sitter/*.wasm.map
+
+# Documentation that duplicates what the README already says.
+node_modules/**/README.md
+node_modules/**/CHANGELOG.md
+node_modules/**/tsconfig.json
+node_modules/**/.github/**
+node_modules/**/examples/**
+# Scratch folders: RTL the user dropped in to reproduce a problem. They are not
+# part of the extension, and shipping someone else's design on the Marketplace
+# is not this package's business.
+new_test/**
+sample/**

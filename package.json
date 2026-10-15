@@ -1,0 +1,348 @@
+{
+  "name": "svision",
+  "displayName": "SVision",
+  "description": "JetBrains-grade IDE experience for SystemVerilog and Verilog: signal completion with types and widths, hover, go-to-definition, diagnostics.",
+  "version": "0.2.1",
+  "publisher": "Nguimaraes",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Snippets"
+  ],
+  "keywords": [
+    "systemverilog",
+    "verilog",
+    "hdl",
+    "rtl",
+    "fpga",
+    "asic"
+  ],
+  "engines.vscodeComment": "Requires VS Code 1.95+",
+  "activationEvents": [
+    "onLanguage:systemverilog",
+    "onLanguage:verilog"
+  ],
+  "main": "./dist/client.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "systemverilog",
+        "aliases": [
+          "SystemVerilog",
+          "systemverilog",
+          "sv"
+        ],
+        "extensions": [
+          ".sv",
+          ".svh",
+          ".svp"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "verilog",
+        "aliases": [
+          "Verilog",
+          "verilog"
+        ],
+        "extensions": [
+          ".v",
+          ".vh"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "svision",
+          "title": "SVision",
+          "icon": "media/sidebar.svg"
+        }
+      ]
+    },
+    "views": {
+      "svision": [
+        {
+          "id": "svision.navigator",
+          "name": "Navigator",
+          "contextualTitle": "Navigator"
+        },
+        {
+          "id": "svision.signalTracer",
+          "name": "Signal Tracer",
+          "contextualTitle": "Signal Tracer"
+        }
+      ]
+    },
+    "grammars": [
+      {
+        "language": "systemverilog",
+        "scopeName": "source.systemverilog",
+        "path": "./syntaxes/systemverilog.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.verilog": "verilog",
+          "meta.embedded.block.systemverilog": "systemverilog"
+        }
+      },
+      {
+        "language": "verilog",
+        "scopeName": "source.verilog",
+        "path": "./syntaxes/verilog.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.verilog": "verilog",
+          "meta.embedded.block.systemverilog": "systemverilog"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "svision.showHierarchy",
+        "title": "Show RTL Hierarchy Graph",
+        "category": "SVision",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "svision.traceSignalAtCursor",
+        "title": "Trace Signal at Cursor",
+        "category": "SVision",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "svision.traceSignal",
+        "title": "Trace Signal",
+        "category": "SVision"
+      },
+      {
+        "command": "svision.showSymbolReport",
+        "title": "SVision: Show Symbol Report",
+        "category": "SVision"
+      },
+      {
+        "command": "svision.restartLanguageServer",
+        "title": "SVision: Restart Language Server",
+        "category": "SVision"
+      },
+      {
+        "command": "svision.showResolvedWidth",
+        "title": "SVision: Explain Width at Cursor",
+        "category": "SVision"
+      },
+      {
+        "command": "svision.refreshNavigator",
+        "title": "Refresh Navigator",
+        "category": "SVision",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "svision.showHierarchy",
+          "when": "editorLangId == systemverilog || editorLangId == verilog"
+        },
+        {
+          "command": "svision.showSymbolReport",
+          "when": "editorLangId == systemverilog || editorLangId == verilog"
+        },
+        {
+          "command": "svision.restartLanguageServer",
+          "when": "editorLangId == systemverilog || editorLangId == verilog"
+        },
+        {
+          "command": "svision.showResolvedWidth",
+          "when": "editorLangId == systemverilog || editorLangId == verilog"
+        },
+        {
+          "command": "svision.traceSignalAtCursor",
+          "when": "editorLangId == systemverilog || editorLangId == verilog"
+        },
+        {
+          "command": "svision.traceSignal",
+          "when": "editorLangId == systemverilog || editorLangId == verilog"
+        },
+        {
+          "command": "svision.refreshNavigator"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "svision.traceSignalAtCursor",
+          "when": "editorLangId == systemverilog || editorLangId == verilog",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "svision.showHierarchy",
+          "when": "editorLangId == systemverilog || editorLangId == verilog",
+          "group": "1_mods@90"
+        },
+        {
+          "command": "svision.showResolvedWidth",
+          "when": "editorLangId == systemverilog || editorLangId == verilog",
+          "group": "1_mods@100"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "svision.refreshNavigator",
+          "when": "view == svision.navigator",
+          "group": "navigation"
+        },
+        {
+          "command": "svision.traceSignalAtCursor",
+          "when": "view == svision.signalTracer",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": []
+    },
+    "keybindings": [
+      {
+        "command": "svision.showResolvedWidth",
+        "key": "ctrl+alt+w",
+        "mac": "cmd+alt+w",
+        "when": "editorTextFocus && (editorLangId == systemverilog || editorLangId == verilog)"
+      }
+    ],
+    "configuration": {
+      "title": "SVision",
+      "properties": {
+        "svision.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the SystemVerilog language server."
+        },
+        "svision.completion.showWidth": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the resolved bit width in completion items and hover cards."
+        },
+        "svision.completion.showType": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the declared type in completion items and hover cards."
+        },
+        "svision.completion.snippets": {
+          "type": "boolean",
+          "default": true,
+          "description": "Offer SystemVerilog scaffolding snippets (always_ff, always_comb, interface, assertions, ...)."
+        },
+        "svision.completion.includeSystemFunctions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include SystemVerilog system functions ($clog2, $bits, $size, ...) in completion."
+        },
+        "svision.completion.includeParameters": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include module parameters in completion."
+        },
+        "svision.diagnostics.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable SystemVerilog diagnostics (syntax, unknown identifiers, width mismatches)."
+        },
+        "svision.diagnostics.unknownIdentifiers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report identifiers that are not declared in any visible scope."
+        },
+        "svision.diagnostics.widthMismatch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report assignments where the resolved widths differ."
+        },
+        "svision.diagnostics.blockingInSequential": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report blocking assignments (=) inside always_ff blocks, where non-blocking (<=) is required."
+        },
+        "svision.diagnostics.implicitSensitivity": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report always_comb / always @* blocks that read a signal without listing it in the sensitivity list."
+        },
+        "svision.diagnostics.latchDetection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report combinational always blocks that can infer a latch."
+        },
+        "svision.index.include": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/*.sv",
+            "**/*.svh",
+            "**/*.svp",
+            "**/*.v",
+            "**/*.vh"
+          ],
+          "description": "Glob patterns for files indexed into the cross-file module/interface/package catalog. Must cover every extension the extension declares as SystemVerilog or Verilog: a package left out of the index has no parameters for other files to resolve."
+        },
+        "svision.index.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/build/**",
+            "**/out/**"
+          ],
+          "description": "Glob patterns excluded from the cross-file index."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "start": "node ./start.mjs",
+    "build": "node ./build.mjs --production",
+    "watch": "node ./build.mjs --watch",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node ./build-tests.mjs && node --test out-test/",
+    "test:all": "npm run check && npm run build && npm test && node --test test/lsp.smoke.test.mjs",
+    "vsix": "vsce package"
+  },
+  "dependencies": {
+    "tree-sitter-systemverilog": "^0.4.1",
+    "vscode-languageclient": "^10.1.2",
+    "vscode-languageserver": "^10.1.2",
+    "vscode-languageserver-textdocument": "^1.0.15",
+    "web-tree-sitter": "^0.27.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.95.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3"
+  },
+  "icon": "media/marketplace.png",
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
+  "bugs": {
+    "url": "https://github.com/nickguimara/SVision/issues"
+  },
+  "homepage": "https://github.com/nickguimara/SVision",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nickguimara/SVision.git"
+  },
+  "qna": false
+}
